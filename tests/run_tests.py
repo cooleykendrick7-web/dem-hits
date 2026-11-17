@@ -15,7 +15,7 @@ from pathlib import Path
 
 TMP = tempfile.mkdtemp(prefix="demhits-test-")
 os.environ["DATA_DIR"] = TMP
-os.environ["ADMIN_PIN"] = "test-admin-pin"
+os.environ["HITZ_ADMIN_KEY"] = "test-admin-key"
 os.environ["SESSION_SECRET"] = "test-secret"
 os.environ.pop("STRIPE_SECRET_KEY", None)
 
@@ -201,11 +201,15 @@ r = artist.get("/dashboard")
 check("earnings shows $0 paid with pending tracked separately",
       'data-paid-total="0"' in r.text and 'data-pending-total="1700"' in r.text)
 
-# admin fulfills the paid download
-r = admin.post("/admin/login", data={"pin": "test-admin-pin"}, follow_redirects=False)
-check("admin login with PIN", r.status_code == 303, str(r.status_code))
-r = admin.post(f"/admin/fulfill/{txd['id']}", follow_redirects=False)
-check("admin fulfill paid download", r.status_code == 303, str(r.status_code))
+# admin is API-only now (HERE owner panel): no login page exists on the site
+r = admin.get("/admin")
+check("admin login page is gone", r.status_code == 404, str(r.status_code))
+r = admin.get("/api/admin/overview")
+check("admin api rejects missing key", r.status_code == 403, str(r.status_code))
+r = admin.get("/api/admin/overview", headers={"X-Admin-Key": "test-admin-key"})
+check("admin api overview works with key", r.status_code == 200 and r.json()["ok"], str(r.status_code))
+r = admin.post(f"/api/admin/fulfill/{txd['id']}", headers={"X-Admin-Key": "test-admin-key"})
+check("admin fulfill paid download", r.status_code == 200 and r.json()["status"] == "paid", str(r.status_code))
 after = tape_data_attrs(fan, tape1)["downloads"]
 check("paid download counts after fulfillment", after == before + 1, f"{before} -> {after}")
 r = fan.get(f"/download/{tape1}")
