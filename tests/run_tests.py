@@ -231,4 +231,127 @@ check("no golden tape on the other tape page", "GOLDEN TAPE" not in r.text)
 r = fan.get("/charts")
 check("golden tape marks the all-time #1 on charts", "golden-tape.jpg" in r.text)
 
+# ---------------- growth pack
+from datetime import datetime, timedelta, timezone
+
+r = fan.get(f"/tape/{tape1}")
+check("tape page has rich share preview (og tags)", 'property="og:title"' in r.text and f"/cover/{tape1}" in r.text and "summary_large_image" in r.text)
+check("tape page has MusicAlbum structured data", "MusicAlbum" in r.text)
+r = anon.get(f"/embed/{tape1}")
+check("embed player loads with tracks + signup hook", r.status_code == 200 and "/stream/" in r.text and "Drop your tape on HITZ" in r.text)
+r = fan.get("/@test_artist")
+check("vanity link opens the artist page", r.status_code == 200 and "Test Artist" in r.text)
+r = fan.get("/genre/hip-hop")
+check("genre page lists the tape", r.status_code == 200 and "First Tape" in r.text)
+r = fan.get("/genres")
+check("genres index lists Hip-Hop", "Hip-Hop" in r.text)
+r = artist.post("/profile", data={"city": "Chicago, IL", "vanity": "test_artist"}, follow_redirects=False)
+check("profile save works", r.status_code == 303, str(r.status_code))
+r = fan.get("/city/chicago-il")
+check("city page lists hometown tapes", r.status_code == 200 and "First Tape" in r.text)
+artist2 = TestClient(demhits.app)
+signup(artist2, "Second Artist", "artist2@test.local", "artist")
+r = artist2.post("/profile", data={"city": "", "vanity": "test_artist"}, follow_redirects=False)
+check("taken vanity link rejected", r.status_code == 400, str(r.status_code))
+r = fan.post("/profile", data={"city": "", "vanity": "tapeking"}, follow_redirects=False)
+r = anon.get("/@tapeking")
+check("fan vanity claim did not take", r.status_code == 404, str(r.status_code))
+
+r = artist.post("/upload", data={"title": "Hosted Tape", "genre": "Hip-Hop", "description": "d",
+                                 "download_mode": "free", "price": "10", "rights": "yes",
+                                 "hosted_by": "DJ Test"},
+                files=[("cover", ("cover.png", PNG_COVER, "image/png")),
+                       ("tracks", ("song.wav", WAV1, "audio/wav"))], follow_redirects=False)
+tape3 = int(r.headers["location"].rstrip("/").split("/")[-1])
+r = fan.get(f"/tape/{tape3}")
+check("hosted-by credit shows on the tape", "DJ Test" in r.text)
+
+r = fan.post(f"/comment/{tape1}", data={"body": "Fire tape, instant classic"}, follow_redirects=False)
+check("comment posts", r.status_code == 303, str(r.status_code))
+r = fan.get(f"/tape/{tape1}")
+check("comment shows on tape page", "Fire tape, instant classic" in r.text)
+r = anon.post(f"/comment/{tape1}", data={"body": "anon"}, follow_redirects=False)
+check("anonymous comment bounces to login", r.status_code == 303 and "/login" in r.headers["location"])
+conn = db()
+cid = conn.execute("SELECT id FROM comments WHERE tape_id=?", (tape1,)).fetchone()[0]
+conn.close()
+r = fan2.post(f"/comment/{cid}/delete", follow_redirects=False)
+check("cannot delete someone else's comment", r.status_code == 403, str(r.status_code))
+r = fan.post(f"/comment/{cid}/delete", follow_redirects=False)
+r = fan.get(f"/tape/{tape1}")
+check("own comment deleted", "Fire tape, instant classic" not in r.text)
+
+future = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+r = artist.post("/upload", data={"title": "Premiere Tape", "genre": "Hip-Hop", "description": "d",
+                                 "download_mode": "free", "price": "10", "rights": "yes",
+                                 "release_at_utc": future},
+                files=[("cover", ("cover.png", PNG_COVER, "image/png")),
+                       ("tracks", ("song.wav", WAV1, "audio/wav"))], follow_redirects=False)
+tape4 = int(r.headers["location"].rstrip("/").split("/")[-1])
+r = fan.get(f"/tape/{tape4}")
+check("premiere page shows countdown + notify", "PREMIERE" in r.text and "Notify Me" in r.text)
+r = fan.post(f"/play/{tape4}")
+check("plays do not count before the drop", r.status_code == 403, str(r.status_code))
+conn = db()
+trk4 = conn.execute("SELECT id FROM tracks WHERE tape_id=?", (tape4,)).fetchone()[0]
+conn.close()
+r = fan.get(f"/stream/{trk4}")
+check("streaming blocked before the drop", r.status_code == 403, str(r.status_code))
+r = fan.post(f"/premiere-notify/{tape4}", follow_redirects=False)
+check("notify-me signup works", r.status_code == 303, str(r.status_code))
+conn = db()
+conn.execute("UPDATE mixtapes SET release_at=? WHERE id=?",
+             ((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), tape4))
+conn.commit()
+conn.close()
+r = fan.get(f"/tape/{tape4}")
+check("tape goes live at drop time", "Notify Me When It Drops" not in r.text)
+r = fan.get(f"/stream/{trk4}")
+check("streaming opens at drop time", r.status_code == 200, str(r.status_code))
+r = fan.get("/notifications")
+check("drop alert delivered to waiting fan", "PREMIERE LIVE" in r.text)
+
+r = fan.post("/playlists", data={"title": "My Crate"}, follow_redirects=False)
+check("playlist created", r.status_code == 303, str(r.status_code))
+conn = db()
+pid = conn.execute("SELECT id FROM playlists WHERE title='My Crate'").fetchone()[0]
+conn.close()
+r = fan.post("/playlist-add", data={"playlist_id": pid, "tape_id": tape1}, follow_redirects=False)
+check("tape added to playlist", r.status_code == 303, str(r.status_code))
+r = anon.get(f"/playlist/{pid}")
+check("public playlist page shows the tape", r.status_code == 200 and "First Tape" in r.text)
+r = artist.post("/playlist-add", data={"playlist_id": pid, "tape_id": tape2}, follow_redirects=False)
+check("cannot add to someone else's playlist", r.status_code == 403, str(r.status_code))
+
+r = artist.post("/versus/start", data={"tape_a": tape1, "tape_b": tape2}, follow_redirects=False)
+check("versus battle starts", r.status_code == 303, str(r.status_code))
+conn = db()
+bid = conn.execute("SELECT id FROM battles ORDER BY id DESC LIMIT 1").fetchone()[0]
+conn.close()
+r = fan.post(f"/versus/{bid}/vote", data={"tape_id": tape1}, follow_redirects=False)
+check("fan vote accepted", r.status_code == 303, str(r.status_code))
+r = fan.post(f"/versus/{bid}/vote", data={"tape_id": tape2}, follow_redirects=False)
+conn = db()
+nv = conn.execute("SELECT COUNT(*) FROM battle_votes WHERE battle_id=?", (bid,)).fetchone()[0]
+conn.close()
+check("one vote per fan in a battle", nv == 1, str(nv))
+r = artist.post("/versus/start", data={"tape_a": tape1, "tape_b": tape3}, follow_redirects=False)
+check("tape already in a battle cannot start another", r.status_code == 400, str(r.status_code))
+conn = db()
+conn.execute("UPDATE battles SET ends_at=? WHERE id=?",
+             ((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), bid))
+conn.commit()
+conn.close()
+r = fan.get("/versus")
+check("finished battle shows a verdict", "Winner decided" in r.text)
+r = fan.get(f"/tape/{tape1}")
+check("versus winner crown shows on the winning tape", "VERSUS WINNER" in r.text)
+
+r = fan.get("/wall-of-paid")
+check("wall of paid shows the real fulfilled payout", "$8.00" in r.text and "Test Artist" in r.text)
+r = anon.get("/sitemap.xml")
+check("sitemap lists live tapes", r.status_code == 200 and f"/tape/{tape1}" in r.text)
+r = anon.get("/robots.txt")
+check("robots points to the sitemap", "sitemap.xml" in r.text)
+
 print(f"\nALL {len(PASS)} CHECKS PASSED")
