@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DEM HITS — THE REAL MIXTAPE CONNECT.
+"""HITZ — THE REAL MIXTAPE CONNECT.
 Public launch version: FastAPI + SQLite, real audio file hosting/streaming.
 
 Money honesty rule: if STRIPE_SECRET_KEY is not set in the environment,
@@ -46,7 +46,7 @@ PREMIUM_PRICE_CENTS = 699
 SUB_PRICE_CENTS = 499
 CASHOUT_THRESHOLD_CENTS = 2500
 
-app = FastAPI(title="DEM HITS")
+app = FastAPI(title="HITZ")
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 
@@ -247,13 +247,13 @@ CSS = """
 *{box-sizing:border-box}body{margin:0;background:#000;color:#f2f2f2;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding-bottom:120px}
 a{color:#e8c15a;text-decoration:none}a:hover{text-decoration:underline}
 header.top{display:flex;align-items:center;gap:14px;padding:10px 16px;background:#0a0a0a;border-bottom:2px solid #c9a227;flex-wrap:wrap}
-header.top img.logo{height:52px;width:auto;display:block}
+header.top img.logo{height:56px;width:auto;max-width:200px;object-fit:contain;display:block}
 nav.main{display:flex;gap:14px;flex-wrap:wrap;font-weight:600}
 nav.main a{color:#e8e8e8}
 .gold{color:#e8c15a}.silver{color:#cfd2d6}.muted{color:#9aa0a6}
 .wrap{max-width:1060px;margin:0 auto;padding:18px 14px}
 .hero{text-align:center;padding:26px 10px 8px}
-.hero img{max-width:340px;width:80%;height:auto}
+.hero img{max-width:560px;width:92%;height:auto;object-fit:contain}
 h1,h2,h3{color:#e8c15a}
 .bigfree{font-size:1.5rem;font-weight:800;color:#000;background:linear-gradient(180deg,#f4d878,#c9a227);display:inline-block;padding:8px 18px;border-radius:8px;margin:10px 0}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:16px}
@@ -335,12 +335,12 @@ def layout(request: Request, title: str, body: str, user=None) -> HTMLResponse:
         auth_links = '<a href="/login">Log in</a><a href="/signup">Sign up free</a>'
     page = f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{html.escape(title)} — DEM HITS</title>
+<title>{html.escape(title)} — HITZ</title>
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" href="/static/icon-192.png">
 <style>{CSS}</style></head><body>
 <header class="top">
-<a href="/"><img class="logo" src="/static/dem-hits-logo.png" alt="DEM HITS — The Real Mixtape Connect"></a>
+<a href="/"><img class="logo" src="/static/hitz-logo.jpg" alt="HITZ — The Real Mixtape Connect"></a>
 <nav class="main">
 <a href="/">Discover</a><a href="/charts">Charts</a><a href="/get-paid">💰 Get Paid</a><a href="/faq">FAQ</a>
 {auth_links}<a href="/admin">Admin</a>
@@ -363,7 +363,7 @@ def layout(request: Request, title: str, body: str, user=None) -> HTMLResponse:
 
 def tape_card(conn, tape, winner_id=None) -> str:
     s = tape_stats(conn, tape["id"])
-    cover = f"/cover/{tape['id']}" if tape["cover_path"] else "/static/dem-hits-logo.png"
+    cover = f"/cover/{tape['id']}" if tape["cover_path"] else "/static/hitz-logo.jpg"
     winner = '<span class="badge">🏆 CHART WINNER</span>' if winner_id == tape["id"] else ""
     sponsored = conn.execute(
         "SELECT 1 FROM transactions WHERE tape_id=? AND kind='sponsored' AND status='paid' "
@@ -383,7 +383,7 @@ def tape_card(conn, tape, winner_id=None) -> str:
 SHARE_JS = """
 <script>
 function dhShare(artist, title){
-  const msg = '🔥 ' + artist + ' — "' + title + '" on DEM HITS, The Real Mixtape Connect. Artists keep 80% of sales, 90% of tips. Free to upload, free to listen.';
+  const msg = '🔥 ' + artist + ' — "' + title + '" on HITZ, The Real Mixtape Connect. Artists keep 80% of sales, 90% of tips. Free to upload, free to listen.';
   if(navigator.clipboard){ navigator.clipboard.writeText(msg).then(()=>alert('Promo message copied — paste it anywhere.')); }
   else { prompt('Copy this promo message:', msg); }
 }
@@ -393,13 +393,13 @@ function dhShare(artist, title){
 # ---------------------------------------------------------------- public pages
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "app": "dem-hits", "payments_connected": PAYMENTS_CONNECTED}
+    return {"ok": True, "app": "hitz", "payments_connected": PAYMENTS_CONNECTED}
 
 
 @app.get("/manifest.webmanifest")
 def manifest():
     return JSONResponse({
-        "name": "DEM HITS — The Real Mixtape Connect", "short_name": "DEM HITS",
+        "name": "HITZ — The Real Mixtape Connect", "short_name": "HITZ",
         "start_url": "/", "display": "standalone", "background_color": "#000000",
         "theme_color": "#c9a227",
         "icons": [{"src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png"},
@@ -436,8 +436,8 @@ def home(request: Request):
 <a class="btn" href="/signup">Create a free Artist account</a></div>"""
         cards = empty
     body = f"""
-<div class="hero"><img src="/static/dem-hits-logo.png" alt="DEM HITS logo">
-<h1>DEM HITS — <span class="silver">THE REAL MIXTAPE CONNECT</span></h1>
+<div class="hero"><img src="/static/hitz-logo.jpg" alt="HITZ logo">
+<h1>HITZ — <span class="silver">THE REAL MIXTAPE CONNECT</span></h1>
 <div class="bigfree">FREE TO UPLOAD</div>
 <p style="font-size:1.1rem">Artists post mixtapes free, fans stream free — and artists actually <b class="gold">get paid</b>:
 80% of sales, 90% of tips, 80% of fan subs.</p>
@@ -482,7 +482,7 @@ def get_paid(request: Request):
     conn.close()
     spots_left = max(0, SPONSORED_MAX_ACTIVE - active)
     body = f"""
-<h1>💰 Get Paid on DEM HITS</h1>
+<h1>💰 Get Paid on HITZ</h1>
 <div class="bigfree">FREE TO UPLOAD — FREE TO EARN</div>
 <p>No card. No upload fee. No follower minimum. You only ever pay if you <i>want</i> optional promo or Pro perks.
 Pro, Sponsored and Premium are <b>always optional</b> — never required to upload or earn.</p>
@@ -493,7 +493,7 @@ Pro, Sponsored and Premium are <b>always optional</b> — never required to uplo
 <div class="card"><h3>Fan Subscriptions — keep 80%</h3><p>Fans subscribe to you for {fmt(SUB_PRICE_CENTS)}/mo. You keep 80%, every month they stay.</p></div>
 <div class="card"><h3>Stream Share</h3><p>A share of the Fan Premium + ads pool, split by your real plays. Free plays build the audience; the pool is funded by Premium and ads.</p></div>
 <div class="card"><h3>Sponsored Spots — {spots_left} of {SPONSORED_MAX_ACTIVE} open</h3><p>Homepage placement: $49 / 3 days · $99 / 7 days · $199 / 14 days. Optional promo, bought by artists and labels.</p></div>
-<div class="card"><h3>DatPiff paid artists $0</h3><p>DatPiff was promo only — artists got no direct pay. DEM HITS was built to fix exactly that.</p></div>
+<div class="card"><h3>Built for artist paydays</h3><p>Promo alone doesn't pay rent. On HITZ every tape can turn plays into money — downloads, tips, subs and stream share, all tracked in your earnings dashboard.</p></div>
 </div>
 <h2>Earnings Calculator</h2>
 <div class="card">
@@ -530,8 +530,8 @@ FAQ_ITEMS = [
     ("Is it free to upload?", "YES. Creating an Artist account and uploading mixtapes is completely free — no card, no upload fee. You can post, get a page, and earn from day one."),
     ("Do I need Pro or Sponsored to upload or earn?", "No. Artist Pro ($9.99/mo), Sponsored placement ($49/$99/$199) and Fan Premium ($6.99/mo) are optional extras. Pro adds a verified badge and a better 85/15 sales split; Sponsored buys homepage promo. Neither is ever required to upload or earn."),
     ("How do I make money as an artist?", "Four ways: paid downloads (you keep 80%, or 85% on Pro), tips (you keep 90%), fan subscriptions (you keep 80%), and stream share from the Fan Premium + ads pool split by your real plays."),
-    ("How and when do I get paid?", "Earnings build in your Artist Earnings Dashboard, split into Paid and Pending. Cash-out starts at $25. You are paid only from money actually collected from fans — DEM HITS never pays out of its own pocket and never shows fake balances."),
-    ("What does DEM HITS keep?", "20% of paid download sales (15% if you are Pro), 10% of tips, and 20% of fan subscriptions. Sponsored, Pro and Premium fees are platform revenue. Stripe fees come out before any split."),
+    ("How and when do I get paid?", "Earnings build in your Artist Earnings Dashboard, split into Paid and Pending. Cash-out starts at $25. You are paid only from money actually collected from fans — HITZ never pays out of its own pocket and never shows fake balances."),
+    ("What does HITZ keep?", "20% of paid download sales (15% if you are Pro), 10% of tips, and 20% of fan subscriptions. Sponsored, Pro and Premium fees are platform revenue. Stripe fees come out before any split."),
     ("Do I keep the rights to my music?", "Yes — you keep 100% of your rights. At upload you confirm the music is yours or you have permission to post it. That protects you and the platform."),
     ("Can I control downloads of my tape?", "Yes. Every tape has a download mode you pick at upload and can change anytime: Stream Only (no downloads for anyone), Free Download (free Fan account), or Paid Download (stream free, download costs your price)."),
     ("What counts as a play?", "A play counts when a listener actually starts playing your tape. The same listener replaying the same tape on the same day does not inflate your count — plays are deduped per listener per day."),
@@ -753,7 +753,7 @@ def cover(tape_id: int):
     row = conn.execute("SELECT cover_path FROM mixtapes WHERE id=?", (tape_id,)).fetchone()
     conn.close()
     if not row or not row["cover_path"] or not Path(row["cover_path"]).exists():
-        return FileResponse(str(BASE_DIR / "static" / "dem-hits-logo.png"), media_type="image/png")
+        return FileResponse(str(BASE_DIR / "static" / "hitz-logo.jpg"), media_type="image/jpeg")
     ext = Path(row["cover_path"]).suffix.lower()
     return FileResponse(row["cover_path"], media_type=MEDIA_TYPES.get(ext, "image/jpeg"))
 

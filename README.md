@@ -1,10 +1,9 @@
-# DEM HITS — THE REAL MIXTAPE CONNECT
+# HITZ — THE REAL MIXTAPE CONNECT
 
 Ken's mixtape platform: artists post mixtapes **free**, fans stream free, and
 artists actually get paid — paid downloads (artist keeps 80%, 85% on Pro),
-tips (90%), fan subscriptions (80%), and stream share. Modeled on what
-DatPiff got right (discovery, charts, sponsored placement) and fixing what
-killed it (artists got $0 direct pay, ad dependence, mobile).
+tips (90%), fan subscriptions (80%), and stream share — with discovery,
+charts and sponsored placement built in from day one.
 
 FastAPI + SQLite, single `app.py`, real audio file hosting and streaming
 (HTTP Range, so the player can seek), persistent bottom player.

@@ -1,4 +1,4 @@
-# DEM HITS — Render Blueprint (free tier to start, $0)
+# HITZ — Render Blueprint (free tier to start, $0)
 # Free web services have no persistent disk: the SQLite DB and uploaded
 # audio reset on redeploy/restart. Before advertising, move to a paid
 # plan + persistent disk mounted at DATA_DIR (or object storage) — the
