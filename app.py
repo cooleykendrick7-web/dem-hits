@@ -30,7 +30,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("DATA_DIR") or os.environ.get("UPLOAD_DIR") or (BASE_DIR / "data"))
 UPLOAD_ROOT = DATA_DIR / "uploads"
 DB_PATH = DATA_DIR / "demhits.db"
-ADMIN_PIN = os.environ.get("ADMIN_PIN", "0000")  # MUST be overridden by env in production
+ADMIN_API_KEY = os.environ.get("HITZ_ADMIN_KEY", "")  # shared secret with the HERE owner panel; no admin login exists on this site
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "dev-secret-change-me")
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 PAYMENTS_CONNECTED = bool(STRIPE_SECRET_KEY)
@@ -150,13 +150,11 @@ def listener_key(request: Request, user=None) -> str:
     return f"ip:{request.client.host if request.client else 'unknown'}"
 
 
-def admin_token() -> str:
-    return hmac.new(SESSION_SECRET.encode(), ADMIN_PIN.encode(), hashlib.sha256).hexdigest()
-
-
 def is_admin(request: Request) -> bool:
-    tok = request.cookies.get("dh_admin")
-    return bool(tok) and hmac.compare_digest(tok, admin_token())
+    # Admin lives in the HERE owner panel now. This site has NO admin login;
+    # the panel's server calls these APIs with the shared secret header.
+    key = request.headers.get("x-admin-key", "")
+    return bool(ADMIN_API_KEY) and hmac.compare_digest(key, ADMIN_API_KEY)
 
 
 # ---------------------------------------------------------------- file utils
@@ -343,7 +341,7 @@ def layout(request: Request, title: str, body: str, user=None) -> HTMLResponse:
 <a href="/"><img class="logo" src="/static/hitz-logo.jpg" alt="HITZ — The Real Mixtape Connect"></a>
 <nav class="main">
 <a href="/">Discover</a><a href="/charts">Charts</a><a href="/get-paid">💰 Get Paid</a><a href="/faq">FAQ</a>
-{auth_links}<a href="/admin">Admin</a>
+{auth_links}
 </nav></header>
 <div class="wrap">{body}</div>
 <div id="player"><div class="row">
@@ -1274,89 +1272,112 @@ def switch_mode(request: Request, tape_id: int, mode: str = Form(...), price: fl
     return RedirectResponse("/dashboard", status_code=303)
 
 
-# ---------------------------------------------------------------- admin
-@app.get("/admin")
-def admin_page(request: Request):
+# ---------------------------------------------------------------- admin API
+# There is NO admin login on this site. Ken checks and runs HITZ from the
+# HERE owner panel (/owner/hitz); that server calls these endpoints with the
+# shared secret in the X-Admin-Key header (env HITZ_ADMIN_KEY on both apps).
+
+def _admin_guard(request: Request):
+    if not ADMIN_API_KEY:
+        return JSONResponse({"ok": False, "error": "admin api not configured"}, status_code=503)
     if not is_admin(request):
-        body = """<h1>Admin</h1>
-<form method="post" action="/admin/login">
-<label>Admin PIN <input name="pin" type="password" required></label>
-<button class="btn" type="submit">Enter</button></form>"""
-        return layout(request, "Admin", body)
+        return JSONResponse({"ok": False, "error": "admin only"}, status_code=403)
+    return None
+
+
+@app.get("/api/admin/overview")
+def admin_overview(request: Request):
+    err = _admin_guard(request)
+    if err:
+        return err
     conn = get_db()
+
+    def count(sql, args=()):
+        return conn.execute(sql, args).fetchone()["c"]
+
     pending = conn.execute(
-        "SELECT * FROM transactions WHERE status IN ('unpaid_request','waitlist') ORDER BY created_at").fetchall()
-    pend_total = sum(r["amount_cents"] for r in pending)
-    pend_lines = "".join(
-        f"""<tr><td data-tx-id="{r['id']}">{r['id']}</td><td>{html.escape(r['kind'])}</td>
-<td>{fmt(r['amount_cents'])}</td><td>{fmt(r['artist_cents'])}</td><td>{fmt(r['platform_cents'])}</td>
-<td>{html.escape(r['status'])}</td><td>{html.escape(r['meta'] or '')}</td>
-<td><form method="post" action="/admin/fulfill/{r['id']}"><button class="btn small" type="submit">Fulfill (payment verified)</button></form></td></tr>"""
-        for r in pending)
+        "SELECT t.*, p.display_name payer_name, a.display_name artist_name "
+        "FROM transactions t LEFT JOIN users p ON p.id=t.payer_id "
+        "LEFT JOIN users a ON a.id=t.artist_id "
+        "WHERE t.status IN ('unpaid_request','waitlist') ORDER BY t.created_at").fetchall()
+    paid = conn.execute(
+        "SELECT COALESCE(SUM(amount_cents),0) amt, COALESCE(SUM(artist_cents),0) art, "
+        "COALESCE(SUM(platform_cents),0) plat FROM transactions WHERE status='paid'").fetchone()
     reports = conn.execute(
-        "SELECT rp.*, m.title FROM reports rp JOIN mixtapes m ON m.id=rp.tape_id WHERE rp.status='open' ORDER BY rp.created_at").fetchall()
-    rep_lines = "".join(
-        f"""<tr><td>{r['id']}</td><td><a href="/tape/{r['tape_id']}">{html.escape(r['title'])}</a></td>
-<td>{html.escape(r['reason'])}</td>
-<td><form method="post" action="/admin/resolve-report/{r['id']}" style="display:inline"><button class="btn small secondary" type="submit">Resolve</button></form>
-<form method="post" action="/admin/remove-tape/{r['tape_id']}" style="display:inline"><button class="btn small" type="submit">Remove tape</button></form></td></tr>"""
-        for r in reports)
+        "SELECT rp.*, m.title FROM reports rp JOIN mixtapes m ON m.id=rp.tape_id "
+        "WHERE rp.status='open' ORDER BY rp.created_at").fetchall()
     tapes = conn.execute(
-        "SELECT m.*, u.display_name artist_name FROM mixtapes m JOIN users u ON u.id=m.artist_id WHERE m.removed=0 ORDER BY m.created_at DESC").fetchall()
-    tape_lines = "".join(
-        f"""<tr><td><a href="/tape/{t['id']}">{html.escape(t['title'])}</a></td><td>{html.escape(t['artist_name'])}</td>
-<td>{mode_badge(t)}</td><td><form method="post" action="/admin/remove-tape/{t['id']}"><button class="btn small secondary" type="submit">Remove</button></form></td></tr>"""
-        for t in tapes)
-    spots = len(sponsored_active(conn))
-    body = f"""<h1>Admin — Owner</h1>
-<h2>Pending Money — <span data-pending-money="{pend_total}">{fmt(pend_total)}</span> waiting</h2>
-<p class="muted">Fulfill a request only after payment is verified. Fulfilling a paid download is what makes it count and downloadable.
-Sponsored spots active: {spots} of {SPONSORED_MAX_ACTIVE}.</p>
-<table><tr><th>ID</th><th>Type</th><th>Amount</th><th>Artist</th><th>Platform</th><th>Status</th><th>Detail</th><th></th></tr>
-{pend_lines or '<tr><td colspan="8" class="muted">No pending requests</td></tr>'}</table>
-<h2 style="margin-top:26px">Open Reports / DMCA</h2>
-<table><tr><th>ID</th><th>Tape</th><th>Reason</th><th></th></tr>{rep_lines or '<tr><td colspan="4" class="muted">No open reports</td></tr>'}</table>
-<h2 style="margin-top:26px">All Tapes</h2>
-<table><tr><th>Tape</th><th>Artist</th><th>Mode</th><th></th></tr>{tape_lines}</table>"""
+        "SELECT m.*, u.display_name artist_name FROM mixtapes m JOIN users u ON u.id=m.artist_id "
+        "WHERE m.removed=0 ORDER BY m.created_at DESC").fetchall()
+    users = conn.execute("SELECT * FROM users ORDER BY created_at DESC LIMIT 25").fetchall()
+    data = {
+        "ok": True,
+        "app": "hitz",
+        "payments_connected": PAYMENTS_CONNECTED,
+        "stats": {
+            "users": count("SELECT COUNT(*) c FROM users"),
+            "artists": count("SELECT COUNT(*) c FROM users WHERE role='artist'"),
+            "fans": count("SELECT COUNT(*) c FROM users WHERE role='fan'"),
+            "tapes": count("SELECT COUNT(*) c FROM mixtapes WHERE removed=0"),
+            "tracks": count("SELECT COUNT(*) c FROM tracks"),
+            "plays": count("SELECT COUNT(*) c FROM events WHERE kind='play'"),
+            "downloads": count("SELECT COUNT(*) c FROM events WHERE kind='download'"),
+            "likes": count("SELECT COUNT(*) c FROM likes"),
+            "follows": count("SELECT COUNT(*) c FROM follows"),
+            "open_reports": len(reports),
+            "sponsored_active": len(sponsored_active(conn)),
+            "sponsored_max": SPONSORED_MAX_ACTIVE,
+            "paid_total_cents": paid["amt"],
+            "paid_artist_cents": paid["art"],
+            "paid_platform_cents": paid["plat"],
+            "pending_total_cents": sum(r["amount_cents"] for r in pending),
+            "pending_count": len(pending),
+        },
+        "pending": [{
+            "id": r["id"], "kind": r["kind"], "amount_cents": r["amount_cents"],
+            "artist_cents": r["artist_cents"], "platform_cents": r["platform_cents"],
+            "status": r["status"], "meta": r["meta"] or "",
+            "payer_name": r["payer_name"] or "", "artist_name": r["artist_name"] or "",
+            "tape_id": r["tape_id"], "created_at": r["created_at"],
+        } for r in pending],
+        "reports": [{
+            "id": r["id"], "tape_id": r["tape_id"], "title": r["title"],
+            "reason": r["reason"], "created_at": r["created_at"],
+        } for r in reports],
+        "tapes": [{
+            "id": t["id"], "title": t["title"], "artist_name": t["artist_name"],
+            "download_mode": t["download_mode"], "price_cents": t["price_cents"],
+            "plays": count("SELECT COUNT(*) c FROM events WHERE tape_id=? AND kind='play'", (t["id"],)),
+            "downloads": count("SELECT COUNT(*) c FROM events WHERE tape_id=? AND kind='download'", (t["id"],)),
+            "created_at": t["created_at"],
+        } for t in tapes],
+        "users": [{
+            "id": u["id"], "display_name": u["display_name"], "email": u["email"],
+            "role": u["role"], "is_pro": bool(u["is_pro"]), "is_premium": bool(u["is_premium"]),
+            "created_at": u["created_at"],
+        } for u in users],
+    }
     conn.close()
-    return layout(request, "Admin", body)
+    return JSONResponse(data)
 
 
-@app.post("/admin/login")
-def admin_login(request: Request, pin: str = Form(...)):
-    if not hmac.compare_digest(pin, ADMIN_PIN):
-        return PlainTextResponse("Wrong PIN", status_code=401)
-    resp = RedirectResponse("/admin", status_code=303)
-    resp.set_cookie("dh_admin", admin_token(), httponly=True, samesite="lax")
-    return resp
-
-
-@app.post("/admin/fulfill/{tx_id}")
-def admin_fulfill(request: Request, tx_id: int):
-    if not is_admin(request):
-        return PlainTextResponse("Admin only", status_code=403)
-    conn = get_db()
-    tx = conn.execute("SELECT * FROM transactions WHERE id=?", (tx_id,)).fetchone()
-    if not tx or tx["status"] == "paid":
-        conn.close()
-        return PlainTextResponse("Request not found or already fulfilled", status_code=404)
-    msg = ""
+def _do_fulfill(conn, tx) -> str:
+    """Mark a money request fulfilled (payment verified by Ken). Returns new status."""
     if tx["kind"] == "sponsored":
         if len(sponsored_active(conn)) >= SPONSORED_MAX_ACTIVE:
-            conn.execute("UPDATE transactions SET status='waitlist' WHERE id=?", (tx_id,))
+            conn.execute("UPDATE transactions SET status='waitlist' WHERE id=?", (tx["id"],))
             conn.commit()
-            conn.close()
-            return RedirectResponse("/admin", status_code=303)
+            return "waitlist"
         days = 7
         for d in SPONSORED_TIERS:
             if f"sponsored_{d}d" in (tx["meta"] or ""):
                 days = d
         expires = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
         conn.execute("UPDATE transactions SET status='paid', fulfilled_at=?, expires_at=? WHERE id=?",
-                     (now_iso(), expires, tx_id))
+                     (now_iso(), expires, tx["id"]))
     else:
         conn.execute("UPDATE transactions SET status='paid', fulfilled_at=? WHERE id=?",
-                     (now_iso(), tx_id))
+                     (now_iso(), tx["id"]))
     if tx["kind"] == "pro" and tx["payer_id"]:
         conn.execute("UPDATE users SET is_pro=1 WHERE id=?", (tx["payer_id"],))
     if tx["kind"] == "premium" and tx["payer_id"]:
@@ -1364,27 +1385,43 @@ def admin_fulfill(request: Request, tx_id: int):
     if tx["kind"] == "paid_download" and tx["tape_id"] and tx["payer_id"]:
         count_download_once(conn, tx["tape_id"], f"user:{tx['payer_id']}:paid")
     conn.commit()
+    return "paid"
+
+
+@app.post("/api/admin/fulfill/{tx_id}")
+def admin_fulfill(request: Request, tx_id: int):
+    err = _admin_guard(request)
+    if err:
+        return err
+    conn = get_db()
+    tx = conn.execute("SELECT * FROM transactions WHERE id=?", (tx_id,)).fetchone()
+    if not tx or tx["status"] == "paid":
+        conn.close()
+        return JSONResponse({"ok": False, "error": "request not found or already fulfilled"}, status_code=404)
+    status = _do_fulfill(conn, tx)
     conn.close()
-    return RedirectResponse("/admin", status_code=303)
+    return JSONResponse({"ok": True, "status": status})
 
 
-@app.post("/admin/resolve-report/{report_id}")
+@app.post("/api/admin/resolve-report/{report_id}")
 def admin_resolve(request: Request, report_id: int):
-    if not is_admin(request):
-        return PlainTextResponse("Admin only", status_code=403)
+    err = _admin_guard(request)
+    if err:
+        return err
     conn = get_db()
     conn.execute("UPDATE reports SET status='resolved' WHERE id=?", (report_id,))
     conn.commit()
     conn.close()
-    return RedirectResponse("/admin", status_code=303)
+    return JSONResponse({"ok": True})
 
 
-@app.post("/admin/remove-tape/{tape_id}")
+@app.post("/api/admin/remove-tape/{tape_id}")
 def admin_remove(request: Request, tape_id: int):
-    if not is_admin(request):
-        return PlainTextResponse("Admin only", status_code=403)
+    err = _admin_guard(request)
+    if err:
+        return err
     conn = get_db()
     conn.execute("UPDATE mixtapes SET removed=1 WHERE id=?", (tape_id,))
     conn.commit()
     conn.close()
-    return RedirectResponse("/admin", status_code=303)
+    return JSONResponse({"ok": True})
