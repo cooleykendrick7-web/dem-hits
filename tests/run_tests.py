@@ -137,6 +137,10 @@ r = fan.get(f"/stream/{track1_id}", headers={"Range": "bytes=0-99"})
 check("range request 206 + correct bytes", r.status_code == 206 and r.content == WAV1[:100]
       and r.headers.get("content-range", "").startswith("bytes 0-99/"), f"{r.status_code} {r.headers.get('content-range')}")
 
+# golden tape: nobody earns it with zero activity
+r = fan.get("/")
+check("no golden tape badge before any real plays", "golden-tape.jpg" not in r.text)
+
 # 7 play dedupe
 r1 = fan.post(f"/play/{tape1}")
 r2 = fan.post(f"/play/{tape1}")
@@ -216,5 +220,15 @@ r = fan.get(f"/download/{tape1}")
 check("buyer can download after fulfillment", r.status_code == 200)
 r = artist.get("/dashboard")
 check("earnings paid updates to $8.00 after fulfillment", 'data-paid-total="800"' in r.text)
+
+# golden tape: tape1 leads on real plays/downloads and wears the badge; tape2 does not
+r = fan.get("/")
+check("golden tape badge on homepage for the leader", "golden-tape.jpg" in r.text and "GOLDEN TAPE" in r.text)
+r = fan.get(f"/tape/{tape1}")
+check("golden tape pill on the winning tape page", "GOLDEN TAPE" in r.text)
+r = fan.get(f"/tape/{tape2}")
+check("no golden tape on the other tape page", "GOLDEN TAPE" not in r.text)
+r = fan.get("/charts")
+check("golden tape marks the all-time #1 on charts", "golden-tape.jpg" in r.text)
 
 print(f"\nALL {len(PASS)} CHECKS PASSED")
