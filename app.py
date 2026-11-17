@@ -133,6 +133,19 @@ def init_db():
             conn.execute(stmt)
         except sqlite3.OperationalError:
             pass
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS verse_entries(
+        id INTEGER PRIMARY KEY, original_tape_id INTEGER NOT NULL, entry_tape_id INTEGER NOT NULL UNIQUE,
+        created_at TEXT NOT NULL);
+    """)
+    for stmt in (
+        "ALTER TABLE mixtapes ADD COLUMN open_verse INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE mixtapes ADD COLUMN open_verse_note TEXT DEFAULT ''",
+    ):
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            pass
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_vanity ON users(vanity) "
                  "WHERE vanity IS NOT NULL AND vanity<>''")
     conn.commit()
@@ -417,8 +430,9 @@ PLAYER_JS = """
 let DH = {list: [], idx: 0, tapeId: null, playedTape: null};
 const aud = () => document.getElementById('dh-audio');
 function dhPlay(tracks, idx, tapeId){
-  DH.list = tracks; DH.idx = idx; DH.tapeId = tapeId; DH.playedTape = null;
+  DH.list = tracks; DH.idx = idx; DH.playedTape = null;
   const t = tracks[idx];
+  DH.tapeId = (t && t.tape) ? t.tape : tapeId;
   const a = aud(); a.src = '/stream/' + t.id;
   document.getElementById('p-title').textContent = t.title;
   document.getElementById('p-artist').textContent = t.artist || '';
@@ -493,7 +507,7 @@ def layout(request: Request, title: str, body: str, user=None, og=None) -> HTMLR
 <header class="top">
 <a href="/"><img class="logo" src="/static/hitz-logo.jpg" alt="HITZ — The Real Mixtape Connect"></a>
 <nav class="main">
-<a href="/">Discover</a><a href="/charts">Charts</a><a href="/versus">⚔️ Versus</a><a href="/get-paid">💰 Get Paid</a><a href="/wall-of-paid">Wall of Paid</a><a href="/faq">FAQ</a>
+<a href="/">Discover</a><a href="/charts">Charts</a><a href="/radio">\U0001F4FB Radio</a><a href="/versus">⚔️ Versus</a><a href="/get-paid">💰 Get Paid</a><a href="/wall-of-paid">Wall of Paid</a><a href="/faq">FAQ</a>
 {auth_links}
 </nav></header>
 <div class="wrap">{body}</div>
@@ -524,6 +538,7 @@ def tape_card(conn, tape, winner_id=None, golden_id=None) -> str:
     prem = "" if live else f'<span class="badge">\U0001F552 PREMIERE — drops {tape["release_at"][:10]}</span>'
     hosted = f'<span class="badge silver">\U0001F3A7 HOSTED BY {html.escape(tape["hosted_by"].upper())}</span>' if tape.get("hosted_by") else ""
     vspill = '<span class="badge gold">\u2694\uFE0F VERSUS WINNER</span>' if tape_won_versus(conn, tape["id"]) else ""
+    ovpill = '<span class="badge">\U0001F3A4 OPEN VERSE</span>' if tape.get("open_verse") else ""
     artist_href = f"/@{tape['artist_vanity']}" if tape.get("artist_vanity") else f"/artist/{tape['artist_id']}"
     genre_html = (f"<a href='/genre/{slugify(tape['genre'])}'>{html.escape(tape['genre'])}</a>"
                   if tape["genre"] else "")
@@ -536,7 +551,7 @@ def tape_card(conn, tape, winner_id=None, golden_id=None) -> str:
 <div class="coverwrap"><a href="/tape/{tape['id']}"><img class="cover" src="{cover}" alt="cover"></a>{golden}</div>
 <div style="margin-top:8px"><a href="/tape/{tape['id']}" style="font-weight:800;color:#fff">{html.escape(tape['title'])}</a></div>
 <div class="muted">by <a href="{artist_href}">{html.escape(tape['artist_name'])}</a> · {genre_html}</div>
-<div><span class="badge dark">{mode_badge(tape)}</span>{winner}{goldpill}{vspill}{prem}{hosted}{sp}</div>
+<div><span class="badge dark">{mode_badge(tape)}</span>{winner}{goldpill}{vspill}{ovpill}{prem}{hosted}{sp}</div>
 <div class="muted" style="margin-top:6px" data-plays="{s['plays']}" data-downloads="{s['downloads']}" data-likes="{s['likes']}">
 ▶ {s['plays']} plays · ⬇ {s['downloads']} downloads · ♥ {s['likes']} likes</div>
 <button class="btn small" style="margin-top:8px" onclick="dhShare('{html.escape(tape['artist_name'], quote=True)}','{html.escape(tape['title'], quote=True)}')">Share</button>
@@ -605,7 +620,7 @@ def home(request: Request):
 <div class="bigfree">FREE TO UPLOAD</div>
 <p style="font-size:1.1rem">Artists post mixtapes free, fans stream free — and artists actually <b class="gold">get paid</b>:
 80% of sales, 90% of tips, 80% of fan subs.</p>
-<p><a class="btn" href="/get-paid">💰 See how you get paid</a> <a class="btn secondary" href="/signup">Create Free Artist Account</a></p>
+<p><a class="btn" href="/radio">\U0001F4FB Play HITZ Radio</a> <a class="btn secondary" href="/get-paid">💰 See how you get paid</a> <a class="btn secondary" href="/signup">Create Free Artist Account</a></p>
 </div>
 {sp_cards}
 <h2>Latest Drops</h2><div class="grid">{cards}</div>
@@ -1166,6 +1181,8 @@ def tape_page(request: Request, tape_id: int):
     owner = bool(user) and user["id"] == tape["artist_id"]
     live = is_live(tape)
     golden_id = golden_tape_id(conn)
+    _wk = chart_rows(conn, since_iso=(datetime.now(timezone.utc) - timedelta(days=7)).isoformat(), limit=1)
+    winner_id = _wk[0][1]["id"] if _wk and _wk[0][0] > 0 else None
     s = tape_stats(conn, tape_id)
     followers = conn.execute("SELECT COUNT(*) c FROM follows WHERE artist_id=?", (tape["artist_id"],)).fetchone()["c"]
     base = site_base(request)
@@ -1187,6 +1204,10 @@ def tape_page(request: Request, tape_id: int):
 <p class="muted">Copy this player code — every play out there still counts here, and the player sends fans back to HITZ.</p>
 <textarea class="code" id="embed-code" rows="3" readonly>{html.escape(embed_code)}</textarea>
 <button class="btn secondary small" type="button" onclick="navigator.clipboard.writeText(document.getElementById('embed-code').value).then(()=>alert('Embed code copied'))">Copy embed code</button></details>"""
+    qr_section = f"""<details><summary>\U0001F4F7 QR code — print it for flyers & posters</summary>
+<p class="muted">Scan it and this tape opens. Put it on show flyers, stickers, posters.</p>
+<img src="/qr/tape/{tape_id}" alt="QR code for this tape" style="width:140px;height:140px;background:#fff;padding:6px;border-radius:8px">
+<p><a href="/qr/tape/{tape_id}" download="hitz-tape-{tape_id}-qr.svg">Download the QR image</a></p></details>"""
     golden_hero = ('<img class="goldentape" src="/static/golden-tape.jpg" alt="GOLDEN TAPE" '
                    'title="GOLDEN TAPE - the most-played tape on HITZ">') if golden_id == tape_id else ""
     golden_pill = ('<span class="badge gold">\U0001F947 GOLDEN TAPE — most plays on HITZ</span> ') if golden_id == tape_id else ""
@@ -1287,12 +1308,18 @@ tick(); setInterval(tick, 1000);
     comment_rows = conn.execute(
         "SELECT c.*, u.display_name FROM comments c JOIN users u ON u.id=c.user_id "
         "WHERE c.tape_id=? ORDER BY c.created_at DESC LIMIT 100", (tape_id,)).fetchall()
+    top_tip = conn.execute(
+        "SELECT payer_id, SUM(amount_cents) tot FROM transactions WHERE artist_id=? AND kind='tip' "
+        "AND status='paid' AND payer_id IS NOT NULL GROUP BY payer_id ORDER BY tot DESC LIMIT 1",
+        (tape["artist_id"],)).fetchone()
+    top_supporter_id = top_tip["payer_id"] if top_tip else None
     comment_lines = ""
     for c in comment_rows:
+        sup = ' <span class="badge gold">\u2B50 TOP SUPPORTER</span>' if c["user_id"] == top_supporter_id else ""
         del_form = (f'<form method="post" action="/comment/{c["id"]}/delete" style="display:inline">'
                     '<button class="btn secondary small" type="submit">Delete</button></form>'
                     if user and c["user_id"] == user["id"] else "")
-        comment_lines += (f"<div class='card' style='margin:8px 0'><b>{html.escape(c['display_name'])}</b> "
+        comment_lines += (f"<div class='card' style='margin:8px 0'><b>{html.escape(c['display_name'])}</b>{sup} "
                           f"<span class='muted'>{html.escape(c['created_at'][:10])}</span>"
                           f"<p style='margin:6px 0'>{html.escape(c['body'])}</p>{del_form}</div>")
     if user:
@@ -1301,12 +1328,59 @@ tick(); setInterval(tick, 1000);
                         '<button class="btn small" type="submit">Post comment</button></form>')
     else:
         comment_form = '<p class="muted"><a href="/login">Log in</a> to comment.</p>'
+    ov_block = ""
+    if tape.get("open_verse"):
+        entries = conn.execute(
+            "SELECT m.*, u.display_name artist_name, u.vanity artist_vanity, u.city artist_city "
+            "FROM verse_entries e JOIN mixtapes m ON m.id=e.entry_tape_id JOIN users u ON u.id=m.artist_id "
+            "WHERE e.original_tape_id=? AND m.removed=0 ORDER BY e.created_at", (tape_id,)).fetchall()
+        entry_cards = "".join(tape_card(conn, dict(e), winner_id, golden_id) for e in entries)
+        link_form = ""
+        if user and user["role"] == "artist" and user["id"] != tape["artist_id"]:
+            entered = {r["entry_tape_id"] for r in conn.execute("SELECT entry_tape_id FROM verse_entries").fetchall()}
+            mine = [m for m in conn.execute(
+                "SELECT id, title FROM mixtapes WHERE artist_id=? AND removed=0 AND id<>? "
+                "AND (release_at IS NULL OR release_at<=?) ORDER BY created_at DESC",
+                (user["id"], tape_id, now_iso())).fetchall() if m["id"] not in entered]
+            if mine:
+                opts = "".join(f"<option value='{m['id']}'>{html.escape(m['title'])}</option>" for m in mine)
+                link_form = (f'<form method="post" action="/verse-entry"><input type="hidden" name="original_id" value="{tape_id}">'
+                             f'<label>Your response tape <select name="entry_id">{opts}</select></label>'
+                             '<button class="btn small" type="submit">\U0001F3A4 Enter this Open Verse</button></form>')
+        note_html = f"<p class='muted'>{html.escape(tape['open_verse_note'])}</p>" if tape.get("open_verse_note") else ""
+        ov_block = (f"<details open><summary>\U0001F3A4 OPEN VERSE — jump on this tape</summary>{note_html}{link_form}"
+                    f"<h4>Entries ({len(entries)})</h4><div class='grid'>"
+                    f"{entry_cards or '<p class=muted>No entries yet — be the first.</p>'}</div></details>")
+    entry_banner = ""
+    _ent = conn.execute(
+        "SELECT o.id, o.title FROM verse_entries e JOIN mixtapes o ON o.id=e.original_tape_id "
+        "WHERE e.entry_tape_id=?", (tape_id,)).fetchone()
+    if _ent:
+        entry_banner = (f"<div class='ok'>\U0001F3A4 This tape is an Open Verse entry for "
+                        f"<a href='/tape/{_ent['id']}'>{html.escape(_ent['title'])}</a></div>")
+    rec_list = [dict(r) for r in conn.execute(
+        "SELECT m.*, u.display_name artist_name, u.vanity artist_vanity, u.city artist_city "
+        "FROM mixtapes m JOIN users u ON u.id=m.artist_id WHERE m.removed=0 AND m.id<>? "
+        "AND (m.release_at IS NULL OR m.release_at<=?) AND m.genre=? ORDER BY m.created_at DESC LIMIT 4",
+        (tape_id, now_iso(), tape["genre"] or "")).fetchall()]
+    if len(rec_list) < 4:
+        _have = {r["id"] for r in rec_list} | {tape_id}
+        for _, _t, _s in chart_rows(conn, limit=12):
+            if len(rec_list) >= 4:
+                break
+            if _t["id"] not in _have:
+                rec_list.append(_t)
+                _have.add(_t["id"])
+    rec_section = ""
+    if rec_list:
+        rec_cards = "".join(tape_card(conn, t, winner_id, golden_id) for t in rec_list)
+        rec_section = f"<h3 style='margin-top:22px'>Fans Also Played</h3><div class='grid'>{rec_cards}</div>"
     body = f"""
 <span class="tapehero"><img src="/cover/{tape_id}" alt="cover" style="width:220px;height:220px;object-fit:cover;border-radius:12px">{golden_hero}</span>
 <h1>{html.escape(tape['title'])}</h1>
 <p>by <a href="/artist/{tape['artist_id']}">{html.escape(tape['artist_name'])}</a> · {html.escape(tape['genre'] or '')} · {followers} followers</p>
 {hosted_line}
-{premiere_banner}
+{premiere_banner}{entry_banner}
 <p>{golden_pill}{vspill}<span class="badge dark">{mode_badge(tape)}</span></p>
 <p class="muted" data-plays="{s['plays']}" data-downloads="{s['downloads']}" data-likes="{s['likes']}">
 \u25B6 {s['plays']} plays · \u2B07 {s['downloads']} downloads · \u2665 {s['likes']} likes</p>
@@ -1320,7 +1394,9 @@ tick(); setInterval(tick, 1000);
 {playlist_block}
 </div>
 {embed_section}
+{qr_section}
 {versus_block}
+{ov_block}
 <h3>Tip the artist — they keep 90%</h3>
 <form method="post" action="/tip/{tape_id}">
 <label>Tip amount ($) <input name="amount" type="number" step="0.5" min="0.5" value="5" style="max-width:160px"></label>
@@ -1329,6 +1405,7 @@ tick(); setInterval(tick, 1000);
 <h3 style="margin-top:22px">Comments</h3>
 {comment_form}
 {comment_lines or '<p class="muted">No comments yet — start the conversation.</p>'}
+{rec_section}
 <h3 style="margin-top:22px">Report</h3>
 <form method="post" action="/report/{tape_id}">
 <label>Reason (copyright / DMCA / other) <input name="reason" required></label>
@@ -1360,12 +1437,28 @@ def artist_page(request: Request, artist_id: int):
                  if a["city"] else "")
     vanity_html = (f"<p class='muted'>\U0001F517 hitzmixtapes.com/@{html.escape(a['vanity'])}</p>"
                    if a["vanity"] else "")
+    sups = conn.execute(
+        "SELECT u.display_name, SUM(t.amount_cents) tot FROM transactions t JOIN users u ON u.id=t.payer_id "
+        "WHERE t.artist_id=? AND t.kind='tip' AND t.status='paid' AND t.payer_id IS NOT NULL "
+        "GROUP BY t.payer_id ORDER BY tot DESC LIMIT 3", (artist_id,)).fetchall()
+    sup_block = ""
+    if sups:
+        _lines = "".join(
+            f"<div class='card' style='margin:6px 0'><b>{html.escape(su['display_name'])}</b> "
+            f"<span class='badge gold'>\u2B50 TOP SUPPORTER</span> "
+            f"<span class='muted'>tipped {fmt(su['tot'])} total</span></div>" for su in sups)
+        sup_block = f"<h3>\u2B50 Top Supporters</h3>{_lines}"
+    qr_html = (f"<p class='muted'><img src='/qr/artist/{artist_id}' alt='QR code for this artist' "
+               "style='width:96px;height:96px;background:#fff;padding:5px;border-radius:8px;vertical-align:middle'> "
+               "Scan to open this page — flyers, posters, everywhere.</p>")
     body = f"""<h1>{html.escape(a['display_name'])}{pro}</h1>
 {city_html}{vanity_html}
 <p class="muted">{followers} followers</p>
 <form method="post" action="/follow/{artist_id}"><button class="btn small" type="submit">Follow Artist</button></form>
 <form method="post" action="/subscribe/{artist_id}" style="margin-top:8px">
 <button class="btn secondary small" type="submit">Subscribe — {fmt(SUB_PRICE_CENTS)}/mo (artist keeps 80%)</button></form>
+{sup_block}
+{qr_html}
 <h2>Tapes</h2><div class="grid">{cards}</div>{SHARE_JS}"""
     conn.close()
     base = site_base(request)
@@ -1682,6 +1775,145 @@ def versus_vote(request: Request, battle_id: int, tape_id: int = Form(...)):
     conn.commit()
     conn.close()
     return RedirectResponse("/versus", status_code=303)
+
+
+
+
+# ---------------------------------------------------------------- radio / QR / open verse
+@app.get("/radio")
+def radio_page(request: Request):
+    conn = get_db()
+    sweep_premieres(conn)
+    rows = conn.execute(
+        "SELECT t.id track_id, t.title track_title, m.id tape_id, m.title tape_title, m.genre "
+        "FROM tracks t JOIN mixtapes m ON m.id=t.tape_id "
+        "WHERE m.removed=0 AND (m.release_at IS NULL OR m.release_at<=?) ORDER BY m.created_at DESC",
+        (now_iso(),)).fetchall()
+    names = {r["id"]: r for r in conn.execute(
+        "SELECT m.id, u.display_name artist_name FROM mixtapes m JOIN users u ON u.id=m.artist_id").fetchall()}
+
+    def item(r):
+        return {"id": r["track_id"], "title": r["track_title"], "tape": r["tape_id"],
+                "artist": (names[r["tape_id"]]["artist_name"] if r["tape_id"] in names else "") + " — " + r["tape_title"]}
+
+    all_items = [item(r) for r in rows]
+    stations = [("all", "\U0001F4FB HITZ Radio — Everything", all_items)]
+    by_genre = {}
+    for r in rows:
+        if r["genre"]:
+            by_genre.setdefault(slugify(r["genre"]), (r["genre"], []))[1].append(item(r))
+    for slug, (gname, items) in sorted(by_genre.items()):
+        stations.append((f"g-{slug}", f"\U0001F3B6 {gname} Radio", items))
+    chart = chart_rows(conn, limit=10)
+    chart_ids = [t["id"] for _, t, _ in chart]
+    by_tape = {}
+    for it in all_items:
+        by_tape.setdefault(it["tape"], []).append(it)
+    golden_items = [it for tid in chart_ids for it in by_tape.get(tid, [])]
+    if golden_items:
+        stations.append(("golden", "\U0001F947 Golden Radio — Top Tapes", golden_items))
+    stations.append(("new", "\U0001F195 Newest Drops Radio", all_items))
+    conn.close()
+    data = {k: items for k, _, items in stations}
+    buttons = "".join(
+        f"<button class='btn' style='margin:4px' onclick=\"dhRadio('{k}')\">\u25B6 {label} ({len(items)})</button>"
+        for k, label, items in stations if items)
+    body = f"""<h1>\U0001F4FB HITZ Radio</h1>
+<p>Nonstop mixtapes. Pick a station and let it ride — every play counts for the artist, same as pressing play on the tape.</p>
+<p>{buttons or '<span class="muted">No tapes on the station yet — the first drop starts the radio.</span>'}</p>
+<p class="muted">Stations shuffle fresh every time you press play. Golden Radio plays the all-time chart leaders back to back.</p>
+<script>
+const STATIONS = {json.dumps(data)};
+function dhRadio(k){{
+  const q = STATIONS[k].slice();
+  for(let i = q.length - 1; i > 0; i--){{ const j = Math.floor(Math.random() * (i + 1)); [q[i], q[j]] = [q[j], q[i]]; }}
+  if(q.length){{ dhPlay(q, 0, null); }}
+}}
+</script>"""
+    return layout(request, "HITZ Radio", body)
+
+
+def make_qr_svg(url: str) -> str:
+    import qrcode
+    import qrcode.image.svg
+    img = qrcode.make(url, image_factory=qrcode.image.svg.SvgPathImage, box_size=10, border=2)
+    return img.to_string().decode()
+
+
+@app.get("/qr/tape/{tape_id}")
+def qr_tape(request: Request, tape_id: int):
+    conn = get_db()
+    row = conn.execute("SELECT id FROM mixtapes WHERE id=? AND removed=0", (tape_id,)).fetchone()
+    conn.close()
+    if not row:
+        return PlainTextResponse("Mixtape not found", status_code=404)
+    return PlainTextResponse(make_qr_svg(f"{site_base(request)}/tape/{tape_id}"), media_type="image/svg+xml")
+
+
+@app.get("/qr/artist/{artist_id}")
+def qr_artist(request: Request, artist_id: int):
+    conn = get_db()
+    row = conn.execute("SELECT id, vanity FROM users WHERE id=? AND role='artist'", (artist_id,)).fetchone()
+    conn.close()
+    if not row:
+        return PlainTextResponse("Artist not found", status_code=404)
+    path = f"/@{row['vanity']}" if row["vanity"] else f"/artist/{artist_id}"
+    return PlainTextResponse(make_qr_svg(site_base(request) + path), media_type="image/svg+xml")
+
+
+@app.post("/tape/{tape_id}/open-verse")
+def open_verse_toggle(request: Request, tape_id: int, open: str = Form("0"), note: str = Form("")):
+    user, redir = require_login(request)
+    if redir:
+        return redir
+    conn = get_db()
+    tape = conn.execute("SELECT * FROM mixtapes WHERE id=?", (tape_id,)).fetchone()
+    if not tape:
+        conn.close()
+        return PlainTextResponse("Mixtape not found", status_code=404)
+    if tape["artist_id"] != user["id"]:
+        conn.close()
+        return PlainTextResponse("Only the tape's artist can open a verse on it.", status_code=403)
+    conn.execute("UPDATE mixtapes SET open_verse=?, open_verse_note=? WHERE id=?",
+                 (1 if open == "1" else 0, note.strip()[:120], tape_id))
+    conn.commit()
+    conn.close()
+    return RedirectResponse("/dashboard", status_code=303)
+
+
+@app.post("/verse-entry")
+def verse_entry(request: Request, original_id: int = Form(...), entry_id: int = Form(...)):
+    user, redir = require_login(request)
+    if redir:
+        return redir
+    if user["role"] != "artist":
+        return PlainTextResponse("Open Verse entries are for Artist accounts.", status_code=403)
+    if original_id == entry_id:
+        return PlainTextResponse("A tape cannot be its own entry.", status_code=400)
+    conn = get_db()
+    orig = conn.execute("SELECT * FROM mixtapes WHERE id=? AND removed=0", (original_id,)).fetchone()
+    entry = conn.execute("SELECT * FROM mixtapes WHERE id=? AND removed=0", (entry_id,)).fetchone()
+    if not orig or not entry:
+        conn.close()
+        return PlainTextResponse("Tape not found", status_code=404)
+    if entry["artist_id"] != user["id"]:
+        conn.close()
+        return PlainTextResponse("You can only enter your own tape.", status_code=403)
+    if not orig["open_verse"] or not is_live(dict(orig)) or not is_live(dict(entry)):
+        conn.close()
+        return PlainTextResponse("That tape is not taking Open Verse entries right now.", status_code=400)
+    try:
+        conn.execute("INSERT INTO verse_entries(original_tape_id,entry_tape_id,created_at) VALUES(?,?,?)",
+                     (original_id, entry_id, now_iso()))
+    except sqlite3.IntegrityError:
+        conn.close()
+        return PlainTextResponse("That tape is already entered in an Open Verse.", status_code=400)
+    notify(conn, orig["artist_id"],
+           f"\U0001F3A4 NEW OPEN VERSE ENTRY: {user['display_name']} jumped on your tape '{orig['title']}' with '{entry['title']}'!",
+           entry_id)
+    conn.commit()
+    conn.close()
+    return RedirectResponse(f"/tape/{original_id}", status_code=303)
 
 
 
@@ -2074,6 +2306,12 @@ def dashboard(request: Request):
 <option value="paid" {'selected' if t['download_mode']=='paid' else ''}>PAID DOWNLOAD</option></select></label>
 <label>Price ($) if Paid <input name="price" type="number" step="0.5" min="1" value="{(t['price_cents'] or 1000)/100:g}" style="max-width:140px"></label>
 <button class="btn small" type="submit">Save mode</button></form>
+<form method="post" action="/tape/{t['id']}/open-verse" style="margin-top:6px">
+<label>Open Verse challenge <select name="open">
+<option value="0" {'selected' if not t['open_verse'] else ''}>Off</option>
+<option value="1" {'selected' if t['open_verse'] else ''}>ON — other artists can jump on this tape</option></select></label>
+<label>Note for challengers <input name="note" value="{html.escape(t['open_verse_note'] or '')}" placeholder="Verse 2 is open — 16 bars"></label>
+<button class="btn secondary small" type="submit">Save Open Verse</button></form>
 <form method="post" action="/sponsored/{t['id']}" style="margin-top:6px">
 <label>Sponsor this tape <select name="days"><option value="3">$49 — 3 days</option>
 <option value="7">$99 — 7 days</option><option value="14">$199 — 14 days</option></select></label>
