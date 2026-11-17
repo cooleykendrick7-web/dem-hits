@@ -9,6 +9,7 @@ a request after verified payment. No fake charges, no fake earnings.
 """
 import hashlib
 import hmac
+import re
 import html
 import io
 import json
@@ -34,6 +35,7 @@ ADMIN_API_KEY = os.environ.get("HITZ_ADMIN_KEY", "")  # shared secret with the H
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "dev-secret-change-me")
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 PAYMENTS_CONNECTED = bool(STRIPE_SECRET_KEY)
+BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
 
 MAX_TRACK_BYTES = 40 * 1024 * 1024
 MAX_COVER_BYTES = 8 * 1024 * 1024
@@ -100,7 +102,39 @@ def init_db():
     CREATE TABLE IF NOT EXISTS reports(
         id INTEGER PRIMARY KEY, tape_id INTEGER NOT NULL, reporter_id INTEGER,
         reason TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'open', created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS comments(
+        id INTEGER PRIMARY KEY, tape_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+        body TEXT NOT NULL, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS playlists(
+        id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, title TEXT NOT NULL,
+        created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS playlist_items(
+        playlist_id INTEGER NOT NULL, tape_id INTEGER NOT NULL, created_at TEXT NOT NULL,
+        PRIMARY KEY(playlist_id, tape_id));
+    CREATE TABLE IF NOT EXISTS premiere_notify(
+        tape_id INTEGER NOT NULL, user_id INTEGER NOT NULL, created_at TEXT NOT NULL,
+        PRIMARY KEY(tape_id, user_id));
+    CREATE TABLE IF NOT EXISTS battles(
+        id INTEGER PRIMARY KEY, tape_a INTEGER NOT NULL, tape_b INTEGER NOT NULL,
+        created_by INTEGER NOT NULL, ends_at TEXT NOT NULL,
+        winner_notified INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS battle_votes(
+        battle_id INTEGER NOT NULL, user_id INTEGER NOT NULL, tape_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL, PRIMARY KEY(battle_id, user_id));
     """)
+    for stmt in (
+        "ALTER TABLE users ADD COLUMN vanity TEXT",
+        "ALTER TABLE users ADD COLUMN city TEXT DEFAULT ''",
+        "ALTER TABLE mixtapes ADD COLUMN hosted_by TEXT DEFAULT ''",
+        "ALTER TABLE mixtapes ADD COLUMN release_at TEXT",
+        "ALTER TABLE mixtapes ADD COLUMN premiere_notified INTEGER NOT NULL DEFAULT 0",
+    ):
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            pass
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_vanity ON users(vanity) "
+                 "WHERE vanity IS NOT NULL AND vanity<>''")
     conn.commit()
     conn.close()
 
@@ -197,8 +231,9 @@ def tape_stats(conn, tape_id: int):
 
 def chart_rows(conn, since_iso=None, limit=50):
     rows = conn.execute(
-        "SELECT m.*, u.display_name artist_name FROM mixtapes m JOIN users u ON u.id=m.artist_id "
-        "WHERE m.removed=0 ORDER BY m.created_at DESC").fetchall()
+        "SELECT m.*, u.display_name artist_name, u.vanity artist_vanity, u.city artist_city FROM mixtapes m JOIN users u ON u.id=m.artist_id "
+        "WHERE m.removed=0 AND (m.release_at IS NULL OR m.release_at<=?) ORDER BY m.created_at DESC",
+        (now_iso(),)).fetchall()
     out = []
     for r in rows:
         if since_iso:
@@ -239,6 +274,90 @@ def fmt(cents: int) -> str:
     return f"${cents/100:,.2f}"
 
 
+def slugify(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+
+
+def site_base(request) -> str:
+    if BASE_URL:
+        return BASE_URL
+    return f"{request.url.scheme}://{request.url.netloc}"
+
+
+def notify(conn, user_id: int, text: str, tape_id=None):
+    conn.execute("INSERT INTO notifications(user_id,text,tape_id,created_at) VALUES(?,?,?,?)",
+                 (user_id, text, tape_id, now_iso()))
+
+
+def is_live(tape) -> bool:
+    ra = tape["release_at"] if "release_at" in tape.keys() else None
+    return not ra or ra <= now_iso()
+
+
+def sweep_premieres(conn):
+    """Tapes whose premiere time has arrived: alert everyone who asked."""
+    due = conn.execute(
+        "SELECT * FROM mixtapes WHERE removed=0 AND premiere_notified=0 "
+        "AND release_at IS NOT NULL AND release_at<=?", (now_iso(),)).fetchall()
+    for t in due:
+        subs = conn.execute("SELECT user_id FROM premiere_notify WHERE tape_id=?", (t["id"],)).fetchall()
+        for s in subs:
+            notify(conn, s["user_id"], f"🔥 PREMIERE LIVE: '{t['title']}' just dropped — listen now!", t["id"])
+        conn.execute("UPDATE mixtapes SET premiere_notified=1 WHERE id=?", (t["id"],))
+    if due:
+        conn.commit()
+
+
+def battle_votes(conn, battle_id: int):
+    rows = conn.execute("SELECT tape_id, COUNT(*) c FROM battle_votes WHERE battle_id=? GROUP BY tape_id",
+                        (battle_id,)).fetchall()
+    return {r["tape_id"]: r["c"] for r in rows}
+
+
+def battle_winner(conn, battle) -> int:
+    """Winning tape id for a finished battle, or 0 (tie / not finished)."""
+    if battle["ends_at"] > now_iso():
+        return 0
+    v = battle_votes(conn, battle["id"])
+    a, b = v.get(battle["tape_a"], 0), v.get(battle["tape_b"], 0)
+    if a == b:
+        return 0
+    return battle["tape_a"] if a > b else battle["tape_b"]
+
+
+def sweep_battles(conn):
+    due = conn.execute("SELECT * FROM battles WHERE winner_notified=0 AND ends_at<=?",
+                       (now_iso(),)).fetchall()
+    for b in due:
+        w = battle_winner(conn, b)
+        for tid in (b["tape_a"], b["tape_b"]):
+            t = conn.execute("SELECT m.title, m.artist_id FROM mixtapes m WHERE m.id=?", (tid,)).fetchone()
+            if not t:
+                continue
+            if w == tid:
+                notify(conn, t["artist_id"], f"⚔️🏆 Your tape '{t['title']}' WON its Versus battle!", tid)
+            elif w:
+                notify(conn, t["artist_id"], f"⚔️ Your Versus battle ended — '{t['title']}' came up short this time. Run it back!", tid)
+            else:
+                notify(conn, t["artist_id"], f"⚔️ Your Versus battle for '{t['title']}' ended in a TIE.", tid)
+        conn.execute("UPDATE battles SET winner_notified=1 WHERE id=?", (b["id"],))
+    if due:
+        conn.commit()
+
+
+def tape_won_versus(conn, tape_id: int) -> bool:
+    rows = conn.execute("SELECT * FROM battles WHERE (tape_a=? OR tape_b=?) AND ends_at<=?",
+                        (tape_id, tape_id, now_iso())).fetchall()
+    return any(battle_winner(conn, b) == tape_id for b in rows)
+
+
+RESERVED_VANITY = {"admin", "api", "tape", "artist", "login", "signup", "logout", "dashboard",
+                   "upload", "charts", "faq", "versus", "playlists", "playlist", "genre",
+                   "genres", "city", "cities", "wall-of-paid", "get-paid", "notifications",
+                   "embed", "cover", "stream", "download", "static", "healthz", "sitemap.xml",
+                   "robots.txt", "hitz", "owner", "settings", "profile", "premiere-notify"}
+
+
 def mode_badge(tape) -> str:
     if tape["download_mode"] == "stream_only":
         return "STREAM ONLY"
@@ -272,6 +391,11 @@ h1,h2,h3{color:#e8c15a}
 .gt-mini{height:22px;width:auto;vertical-align:middle;transform:rotate(-8deg);margin-right:6px;border-radius:3px}
 .tapehero{position:relative;display:inline-block}
 .tapehero .goldentape{width:104px;left:-14px;top:16px}
+.bar{height:12px;background:#222;border-radius:6px;overflow:hidden;margin:6px 0}
+.bar>i{display:block;height:100%;background:linear-gradient(90deg,#f4d878,#c9a227)}
+.countdown{font-size:1.6rem;font-weight:800;color:#e8c15a;letter-spacing:1px}
+.chip{display:inline-block;background:#181818;border:1px solid #c9a227;color:#e8c15a;border-radius:20px;padding:5px 12px;margin:3px;font-weight:600}
+textarea.code{width:100%;background:#0d0d0d;color:#cfd2d6;font-family:monospace;font-size:.8rem}
 .btn{display:inline-block;background:linear-gradient(180deg,#f4d878,#c9a227);color:#000;font-weight:700;border:none;padding:9px 16px;border-radius:8px;cursor:pointer;font-size:.95rem}
 .btn.secondary{background:#222;color:#e8c15a;border:1px solid #c9a227}
 .btn.small{padding:5px 10px;font-size:.85rem}
@@ -327,7 +451,7 @@ document.addEventListener('DOMContentLoaded', () => {
 """
 
 
-def layout(request: Request, title: str, body: str, user=None) -> HTMLResponse:
+def layout(request: Request, title: str, body: str, user=None, og=None) -> HTMLResponse:
     if user is None:
         user = current_user(request)
     conn = get_db()
@@ -336,8 +460,24 @@ def layout(request: Request, title: str, body: str, user=None) -> HTMLResponse:
         unread = conn.execute("SELECT COUNT(*) c FROM notifications WHERE user_id=? AND is_read=0",
                               (user["id"],)).fetchone()["c"]
     conn.close()
+    base = site_base(request)
+    if og is None:
+        og = {"title": "HITZ — The Real Mixtape Connect",
+              "desc": "Artists upload FREE and GET PAID: 80% of downloads, 90% of tips, fan subscriptions, real charts.",
+              "image": base + "/static/hitz-logo.jpg", "url": base + "/"}
+    og_tags = (f'<meta property="og:type" content="website">'
+               f'<meta property="og:site_name" content="HITZ">'
+               f'<meta property="og:title" content="{html.escape(og["title"], quote=True)}">'
+               f'<meta property="og:description" content="{html.escape(og["desc"], quote=True)}">'
+               f'<meta property="og:image" content="{html.escape(og["image"], quote=True)}">'
+               f'<meta property="og:url" content="{html.escape(og["url"], quote=True)}">'
+               f'<meta name="twitter:card" content="summary_large_image">'
+               f'<meta name="twitter:title" content="{html.escape(og["title"], quote=True)}">'
+               f'<meta name="twitter:description" content="{html.escape(og["desc"], quote=True)}">'
+               f'<meta name="twitter:image" content="{html.escape(og["image"], quote=True)}">'
+               f'<meta name="description" content="{html.escape(og["desc"], quote=True)}">')
     if user:
-        auth_links = (f'<a href="/dashboard">Dashboard</a>'
+        auth_links = (f'<a href="/playlists">Playlists</a><a href="/dashboard">Dashboard</a>'
                       f'<a href="/notifications">Alerts{" (" + str(unread) + ")" if unread else ""}</a>'
                       f'<a href="/logout">Log out</a>')
         if user["role"] == "artist":
@@ -346,14 +486,14 @@ def layout(request: Request, title: str, body: str, user=None) -> HTMLResponse:
         auth_links = '<a href="/login">Log in</a><a href="/signup">Sign up free</a>'
     page = f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{html.escape(title)} — HITZ</title>
+<title>{html.escape(title)} — HITZ</title>{og_tags}
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" href="/static/icon-192.png">
 <style>{CSS}</style></head><body>
 <header class="top">
 <a href="/"><img class="logo" src="/static/hitz-logo.jpg" alt="HITZ — The Real Mixtape Connect"></a>
 <nav class="main">
-<a href="/">Discover</a><a href="/charts">Charts</a><a href="/get-paid">💰 Get Paid</a><a href="/faq">FAQ</a>
+<a href="/">Discover</a><a href="/charts">Charts</a><a href="/versus">⚔️ Versus</a><a href="/get-paid">💰 Get Paid</a><a href="/wall-of-paid">Wall of Paid</a><a href="/faq">FAQ</a>
 {auth_links}
 </nav></header>
 <div class="wrap">{body}</div>
@@ -380,14 +520,23 @@ def tape_card(conn, tape, winner_id=None, golden_id=None) -> str:
         "SELECT 1 FROM transactions WHERE tape_id=? AND kind='sponsored' AND status='paid' "
         "AND (expires_at IS NULL OR expires_at>?)", (tape["id"], now_iso())).fetchone()
     sp = '<span class="badge silver">SPONSORED</span>' if sponsored else ""
+    live = is_live(tape)
+    prem = "" if live else f'<span class="badge">\U0001F552 PREMIERE — drops {tape["release_at"][:10]}</span>'
+    hosted = f'<span class="badge silver">\U0001F3A7 HOSTED BY {html.escape(tape["hosted_by"].upper())}</span>' if tape.get("hosted_by") else ""
+    vspill = '<span class="badge gold">\u2694\uFE0F VERSUS WINNER</span>' if tape_won_versus(conn, tape["id"]) else ""
+    artist_href = f"/@{tape['artist_vanity']}" if tape.get("artist_vanity") else f"/artist/{tape['artist_id']}"
+    genre_html = (f"<a href='/genre/{slugify(tape['genre'])}'>{html.escape(tape['genre'])}</a>"
+                  if tape["genre"] else "")
+    stats_line = (f"\u25B6 {s['plays']} plays \u00B7 \u2B07 {s['downloads']} downloads \u00B7 \u2665 {s['likes']} likes"
+                  if live else f"\U0001F525 Premiere \u2014 drops {tape['release_at'][:10]}. Be here when it lands.")
     golden = ('<img class="goldentape" src="/static/golden-tape.jpg" alt="GOLDEN TAPE" '
               'title="GOLDEN TAPE - the most-played tape on HITZ">') if golden_id == tape["id"] else ""
     goldpill = '<span class="badge gold">\U0001F947 GOLDEN TAPE</span>' if golden_id == tape["id"] else ""
     return f"""<div class="card">
 <div class="coverwrap"><a href="/tape/{tape['id']}"><img class="cover" src="{cover}" alt="cover"></a>{golden}</div>
 <div style="margin-top:8px"><a href="/tape/{tape['id']}" style="font-weight:800;color:#fff">{html.escape(tape['title'])}</a></div>
-<div class="muted">by <a href="/artist/{tape['artist_id']}">{html.escape(tape['artist_name'])}</a> · {html.escape(tape['genre'] or '')}</div>
-<div><span class="badge dark">{mode_badge(tape)}</span>{winner}{goldpill}{sp}</div>
+<div class="muted">by <a href="{artist_href}">{html.escape(tape['artist_name'])}</a> · {genre_html}</div>
+<div><span class="badge dark">{mode_badge(tape)}</span>{winner}{goldpill}{vspill}{prem}{hosted}{sp}</div>
 <div class="muted" style="margin-top:6px" data-plays="{s['plays']}" data-downloads="{s['downloads']}" data-likes="{s['likes']}">
 ▶ {s['plays']} plays · ⬇ {s['downloads']} downloads · ♥ {s['likes']} likes</div>
 <button class="btn small" style="margin-top:8px" onclick="dhShare('{html.escape(tape['artist_name'], quote=True)}','{html.escape(tape['title'], quote=True)}')">Share</button>
@@ -426,7 +575,7 @@ def home(request: Request):
     conn = get_db()
     user = current_user(request)
     latest = conn.execute(
-        "SELECT m.*, u.display_name artist_name FROM mixtapes m JOIN users u ON u.id=m.artist_id "
+        "SELECT m.*, u.display_name artist_name, u.vanity artist_vanity, u.city artist_city FROM mixtapes m JOIN users u ON u.id=m.artist_id "
         "WHERE m.removed=0 ORDER BY m.created_at DESC LIMIT 12").fetchall()
     trending = chart_rows(conn, limit=6)
     week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
@@ -440,7 +589,7 @@ def home(request: Request):
     sp_cards = ""
     if sp_ids:
         rows = conn.execute(
-            "SELECT m.*, u.display_name artist_name FROM mixtapes m JOIN users u ON u.id=m.artist_id "
+            "SELECT m.*, u.display_name artist_name, u.vanity artist_vanity, u.city artist_city FROM mixtapes m JOIN users u ON u.id=m.artist_id "
             f"WHERE m.id IN ({','.join('?' * len(sp_ids))})", sp_ids).fetchall()
         sp_cards = ("<h2>Sponsored</h2><div class='grid'>" +
                     "".join(tape_card(conn, dict(r), winner_id, golden_id) for r in rows) + "</div>")
@@ -461,6 +610,7 @@ def home(request: Request):
 {sp_cards}
 <h2>Latest Drops</h2><div class="grid">{cards}</div>
 <h2 style="margin-top:28px">Trending</h2><div class="grid">{trend_cards or '<p class="muted">Nothing trending yet.</p>'}</div>
+<h2 style="margin-top:28px">Browse</h2><p><a class="chip" href="/genres">\U0001F3B6 Genres</a><a class="chip" href="/cities">\U0001F4CD Cities</a><a class="chip" href="/versus">\u2694\uFE0F Versus Battles</a><a class="chip" href="/wall-of-paid">\U0001F4B0 Wall of Paid</a></p>
 {SHARE_JS}"""
     return layout(request, "Discover", body, user)
 
@@ -512,6 +662,7 @@ Pro, Sponsored and Premium are <b>always optional</b> — never required to uplo
 <div class="card"><h3>Fan Subscriptions — keep 80%</h3><p>Fans subscribe to you for {fmt(SUB_PRICE_CENTS)}/mo. You keep 80%, every month they stay.</p></div>
 <div class="card"><h3>Stream Share</h3><p>A share of the Fan Premium + ads pool, split by your real plays. Free plays build the audience; the pool is funded by Premium and ads.</p></div>
 <div class="card"><h3>Sponsored Spots — {spots_left} of {SPONSORED_MAX_ACTIVE} open</h3><p>Homepage placement: $49 / 3 days · $99 / 7 days · $199 / 14 days. Optional promo, bought by artists and labels.</p></div>
+<div class="card"><h3><a href="/wall-of-paid">Wall of Paid</a></h3><p>Every real artist payout, posted in public. Proof pays better than promises — <a href="/wall-of-paid">see the wall</a>.</p></div>
 <div class="card"><h3>Built for artist paydays</h3><p>Promo alone doesn't pay rent. On HITZ every tape can turn plays into money — downloads, tips, subs and stream share, all tracked in your earnings dashboard.</p></div>
 </div>
 <h2>Earnings Calculator</h2>
@@ -571,6 +722,175 @@ def faq(request: Request):
     return layout(request, "FAQ", body)
 
 
+
+# ---------------------------------------------------------------- growth: wall, browse, embed, vanity, seo
+@app.get("/wall-of-paid")
+def wall_of_paid(request: Request):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT t.*, a.display_name artist_name, a.vanity artist_vanity, m.title tape_title "
+        "FROM transactions t JOIN users a ON a.id=t.artist_id LEFT JOIN mixtapes m ON m.id=t.tape_id "
+        "WHERE t.status='paid' AND t.artist_cents>0 AND t.kind IN ('tip','paid_download','subscription') "
+        "ORDER BY t.fulfilled_at DESC LIMIT 100").fetchall()
+    total = sum(r["artist_cents"] for r in rows)
+    conn.close()
+    labels = {"tip": "Tip", "paid_download": "Download sale", "subscription": "Fan subscription"}
+    lines = ""
+    for r in rows:
+        href = f"/@{r['artist_vanity']}" if r["artist_vanity"] else f"/artist/{r['artist_id']}"
+        when = (r["fulfilled_at"] or r["created_at"])[:10]
+        tape = f" — '{html.escape(r['tape_title'])}'" if r["tape_title"] else ""
+        lines += (f"<div class='card' style='margin:8px 0'><b class='gold'>{fmt(r['artist_cents'])}</b> "
+                  f"paid to <a href='{href}'>{html.escape(r['artist_name'])}</a> "
+                  f"<span class='muted'>{labels.get(r['kind'], r['kind'])}{tape} · {when}</span></div>")
+    body = f"""<h1>\U0001F4B0 Wall of Paid</h1>
+<p>Every artist payout on HITZ, in public. Money only lands here after it was <b>actually collected and paid out</b> — no fake balances, ever.</p>
+<p style="font-size:1.3rem">Total paid to artists: <b class="gold">{fmt(total)}</b></p>
+{lines or '<div class="card" style="text-align:center;padding:24px"><h3>Be the first name on this wall</h3><p class="muted">No payouts yet. The first artist to cash out makes history here.</p><a class="btn" href="/signup">Create a free Artist account</a></div>'}
+<p class="muted">How artists earn: <a href="/get-paid">Get Paid page</a>.</p>"""
+    return layout(request, "Wall of Paid", body)
+
+
+@app.get("/genres")
+def genres_index(request: Request):
+    conn = get_db()
+    rows = conn.execute("SELECT genre, COUNT(*) c FROM mixtapes WHERE removed=0 AND genre<>'' GROUP BY genre ORDER BY c DESC").fetchall()
+    conn.close()
+    chips = "".join(f"<a class='chip' href='/genre/{slugify(r['genre'])}'>{html.escape(r['genre'])} ({r['c']})</a>" for r in rows)
+    return layout(request, "Genres", f"<h1>Genres</h1><p>{chips or '<span class=muted>No genres yet.</span>'}</p>")
+
+
+@app.get("/genre/{slug}")
+def genre_page(request: Request, slug: str):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT m.*, u.display_name artist_name, u.vanity artist_vanity, u.city artist_city "
+        "FROM mixtapes m JOIN users u ON u.id=m.artist_id WHERE m.removed=0 ORDER BY m.created_at DESC").fetchall()
+    match = [dict(r) for r in rows if slugify(r["genre"] or "") == slug]
+    if not match:
+        conn.close()
+        return PlainTextResponse("Genre not found", status_code=404)
+    weekly = chart_rows(conn, since_iso=(datetime.now(timezone.utc) - timedelta(days=7)).isoformat(), limit=50)
+    winner_id = weekly[0][1]["id"] if weekly and weekly[0][0] > 0 else None
+    golden_id = golden_tape_id(conn)
+    cards = "".join(tape_card(conn, t, winner_id, golden_id) for t in match)
+    name = match[0]["genre"]
+    conn.close()
+    body = f"<h1>{html.escape(name)}</h1><p class='muted'>{len(match)} tape(s) · <a href='/genres'>All genres</a></p><div class='grid'>{cards}</div>{{SHARE}}"
+    return layout(request, name, body.replace("{SHARE}", SHARE_JS))
+
+
+@app.get("/cities")
+def cities_index(request: Request):
+    conn = get_db()
+    rows = conn.execute("SELECT city, COUNT(*) c FROM users WHERE role='artist' AND city<>'' GROUP BY city ORDER BY c DESC").fetchall()
+    conn.close()
+    chips = "".join(f"<a class='chip' href='/city/{slugify(r['city'])}'>{html.escape(r['city'])} ({r['c']} artists)</a>" for r in rows)
+    return layout(request, "Cities", f"<h1>Cities</h1><p>{chips or '<span class=muted>No hometowns set yet.</span>'}</p>")
+
+
+@app.get("/city/{slug}")
+def city_page(request: Request, slug: str):
+    conn = get_db()
+    artists = [dict(r) for r in conn.execute("SELECT * FROM users WHERE role='artist'").fetchall()
+               if slugify(r["city"] or "") == slug]
+    if not artists:
+        conn.close()
+        return PlainTextResponse("City not found", status_code=404)
+    ids = [a["id"] for a in artists]
+    rows = conn.execute(
+        "SELECT m.*, u.display_name artist_name, u.vanity artist_vanity, u.city artist_city "
+        f"FROM mixtapes m JOIN users u ON u.id=m.artist_id WHERE m.removed=0 AND m.artist_id IN ({','.join('?' * len(ids))}) "
+        "ORDER BY m.created_at DESC", ids).fetchall()
+    weekly = chart_rows(conn, since_iso=(datetime.now(timezone.utc) - timedelta(days=7)).isoformat(), limit=50)
+    winner_id = weekly[0][1]["id"] if weekly and weekly[0][0] > 0 else None
+    golden_id = golden_tape_id(conn)
+    cards = "".join(tape_card(conn, dict(r), winner_id, golden_id) for r in rows)
+    chips = "".join(
+        f"<a class='chip' href='/{('@' + a['vanity']) if a['vanity'] else 'artist/' + str(a['id'])}'>{html.escape(a['display_name'])}</a>"
+        for a in artists)
+    name = artists[0]["city"]
+    conn.close()
+    body = f"<h1>\U0001F4CD {html.escape(name)}</h1><h3>Artists</h3><p>{chips}</p><h3>Tapes</h3><div class='grid'>{cards or '<p class=muted>No tapes yet.</p>'}</div>{{SHARE}}"
+    return layout(request, name, body.replace("{SHARE}", SHARE_JS))
+
+
+@app.get("/embed/{tape_id}")
+def embed_player(request: Request, tape_id: int):
+    conn = get_db()
+    row = conn.execute(
+        "SELECT m.*, u.display_name artist_name FROM mixtapes m JOIN users u ON u.id=m.artist_id WHERE m.id=?",
+        (tape_id,)).fetchone()
+    if not row or row["removed"]:
+        conn.close()
+        return PlainTextResponse("Mixtape not found", status_code=404)
+    tape = dict(row)
+    tracks = conn.execute("SELECT * FROM tracks WHERE tape_id=? ORDER BY track_num", (tape_id,)).fetchall()
+    conn.close()
+    base = site_base(request)
+    live = is_live(tape)
+    if live:
+        players = "".join(
+            f"<div style='margin:8px 0'><div style='font-size:.9rem;margin-bottom:3px'>{i+1}. {html.escape(t['title'])}</div>"
+            f"<audio controls preload='none' src='/stream/{t['id']}' style='width:100%'></audio></div>"
+            for i, t in enumerate(tracks))
+        inner = players + f"<p style='margin:10px 0 0'><a href='{base}/tape/{tape_id}' target='_blank' style='color:#e8c15a'>Listen on HITZ \u2192</a></p>"
+    else:
+        inner = f"<p style='font-size:1.05rem'>\U0001F552 PREMIERE — drops {tape['release_at'][:10]}</p><p><a href='{base}/tape/{tape_id}' target='_blank' style='color:#e8c15a'>Get notified on HITZ \u2192</a></p>"
+    page = f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>{html.escape(tape['title'])} — HITZ</title></head>
+<body style="margin:0;background:#0a0a0a;color:#f2f2f2;font-family:system-ui,sans-serif;padding:12px">
+<div style="display:flex;gap:12px;align-items:center">
+<img src="{base}/cover/{tape_id}" alt="cover" style="width:84px;height:84px;object-fit:cover;border-radius:8px">
+<div><div style="font-weight:800;font-size:1.05rem">{html.escape(tape['title'])}</div>
+<div style="color:#9aa0a6">{html.escape(tape['artist_name'])}{' · \U0001F3A7 Hosted by ' + html.escape(tape['hosted_by']) if tape.get('hosted_by') else ''}</div>
+<div style="color:#e8c15a;font-weight:700;font-size:.85rem">HITZ — THE REAL MIXTAPE CONNECT</div></div></div>
+{inner}
+<p style="margin:12px 0 0;font-size:.9rem"><a href="{base}/signup" target="_blank" style="color:#e8c15a;font-weight:700">Drop your tape on HITZ — FREE \u2192</a></p>
+<script>
+let counted = false;
+document.querySelectorAll('audio').forEach(a => a.addEventListener('play', () => {{
+  if(!counted){{ counted = true; fetch('/play/__TAPE__', {{method:'POST'}}).catch(()=>{{}}); }}
+}}));
+</script></body></html>""".replace("__TAPE__", str(tape_id))
+    return HTMLResponse(page, headers={"Content-Security-Policy": "frame-ancestors *"})
+
+
+@app.get("/@{vanity}")
+def vanity_page(request: Request, vanity: str):
+    conn = get_db()
+    row = conn.execute("SELECT id FROM users WHERE vanity=? AND role='artist'", (vanity.lower(),)).fetchone()
+    conn.close()
+    if not row:
+        return PlainTextResponse("Artist not found", status_code=404)
+    return artist_page(request, row["id"])
+
+
+@app.get("/robots.txt")
+def robots(request: Request):
+    return PlainTextResponse(f"User-agent: *\nAllow: /\nSitemap: {site_base(request)}/sitemap.xml\n",
+                             media_type="text/plain")
+
+
+@app.get("/sitemap.xml")
+def sitemap(request: Request):
+    base = site_base(request)
+    conn = get_db()
+    tapes = conn.execute("SELECT id, release_at FROM mixtapes WHERE removed=0").fetchall()
+    artists = conn.execute("SELECT id, vanity FROM users WHERE role='artist'").fetchall()
+    genres = {slugify(r["genre"]) for r in conn.execute("SELECT DISTINCT genre FROM mixtapes WHERE removed=0 AND genre<>''").fetchall()}
+    cities = {slugify(r["city"]) for r in conn.execute("SELECT DISTINCT city FROM users WHERE role='artist' AND city<>''").fetchall()}
+    conn.close()
+    urls = ["/", "/charts", "/get-paid", "/faq", "/wall-of-paid", "/versus", "/genres", "/cities"]
+    urls += [f"/tape/{t['id']}" for t in tapes if is_live(dict(t))]
+    urls += [(f"/@{a['vanity']}" if a["vanity"] else f"/artist/{a['id']}") for a in artists]
+    urls += [f"/genre/{g}" for g in sorted(genres) if g]
+    urls += [f"/city/{c}" for c in sorted(cities) if c]
+    items = "".join(f"<url><loc>{html.escape(base + u)}</loc></url>" for u in urls)
+    return PlainTextResponse(f'<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{items}</urlset>',
+                             media_type="application/xml")
+
+
 # ---------------------------------------------------------------- auth routes
 @app.get("/signup")
 def signup_page(request: Request):
@@ -580,6 +900,7 @@ def signup_page(request: Request):
 <label>Display name <input name="display_name" required></label>
 <label>Email <input name="email" type="email" required></label>
 <label>Password <input name="password" type="password" required minlength="6"></label>
+<label>City / hometown <span class="muted">(optional — fans find you by city)</span> <input name="city" placeholder="Chicago, IL"></label>
 <label>I am an <select name="role"><option value="artist">Artist — I post mixtapes</option>
 <option value="fan">Fan — I listen, download, tip</option></select></label>
 <button class="btn" type="submit">Create free account</button></form>
@@ -589,7 +910,7 @@ def signup_page(request: Request):
 
 @app.post("/signup")
 def signup(request: Request, display_name: str = Form(...), email: str = Form(...),
-           password: str = Form(...), role: str = Form(...)):
+           password: str = Form(...), role: str = Form(...), city: str = Form("")):
     if role not in ("artist", "fan"):
         return PlainTextResponse("Invalid role", status_code=400)
     email = email.strip().lower()
@@ -599,8 +920,14 @@ def signup(request: Request, display_name: str = Form(...), email: str = Form(..
         return PlainTextResponse("An account with that email already exists", status_code=400)
     pw_hash, pw_salt = hash_password(password)
     cur = conn.execute(
-        "INSERT INTO users(email,display_name,role,pw_hash,pw_salt,created_at) VALUES(?,?,?,?,?,?)",
-        (email, display_name.strip(), role, pw_hash, pw_salt, now_iso()))
+        "INSERT INTO users(email,display_name,role,pw_hash,pw_salt,created_at,city) VALUES(?,?,?,?,?,?,?)",
+        (email, display_name.strip(), role, pw_hash, pw_salt, now_iso(), city.strip()))
+    if role == "artist":
+        base_v = re.sub(r"[^a-z0-9_]+", "_", display_name.strip().lower()).strip("_")
+        if len(base_v) >= 3 and base_v not in RESERVED_VANITY:
+            taken = conn.execute("SELECT 1 FROM users WHERE vanity=?", (base_v,)).fetchone()
+            vanity = base_v if not taken else f"{base_v}{cur.lastrowid}"
+            conn.execute("UPDATE users SET vanity=? WHERE id=?", (vanity, cur.lastrowid))
     token = secrets.token_urlsafe(32)
     conn.execute("INSERT INTO sessions(token,user_id,created_at) VALUES(?,?,?)",
                  (token, cur.lastrowid, now_iso()))
@@ -660,6 +987,32 @@ def require_login(request: Request):
     return user, None
 
 
+# ---------------------------------------------------------------- profile
+@app.post("/profile")
+def profile(request: Request, city: str = Form(""), vanity: str = Form("")):
+    user, redir = require_login(request)
+    if redir:
+        return redir
+    conn = get_db()
+    conn.execute("UPDATE users SET city=? WHERE id=?", (city.strip(), user["id"]))
+    v = vanity.strip().lower()
+    if v and user["role"] == "artist":
+        if not re.fullmatch(r"[a-z0-9_]{3,20}", v):
+            conn.close()
+            return PlainTextResponse("Vanity link must be 3-20 characters: lowercase letters, numbers, underscore.", status_code=400)
+        if v in RESERVED_VANITY:
+            conn.close()
+            return PlainTextResponse("That link name is reserved — pick another.", status_code=400)
+        taken = conn.execute("SELECT id FROM users WHERE vanity=?", (v,)).fetchone()
+        if taken and taken["id"] != user["id"]:
+            conn.close()
+            return PlainTextResponse("That vanity link is already taken.", status_code=400)
+        conn.execute("UPDATE users SET vanity=? WHERE id=?", (v, user["id"]))
+    conn.commit()
+    conn.close()
+    return RedirectResponse("/dashboard", status_code=303)
+
+
 # ---------------------------------------------------------------- upload
 @app.get("/upload")
 def upload_page(request: Request):
@@ -675,6 +1028,10 @@ def upload_page(request: Request):
 <label>Mixtape title <input name="title" required></label>
 <label>Cover image (jpg / png / webp) <input name="cover" type="file" accept=".jpg,.jpeg,.png,.webp" required></label>
 <label>Genre <input name="genre" placeholder="Hip-Hop / Rap"></label>
+<label>Hosted by <span class="muted">(optional — a DJ or host credit, shown on your tape)</span> <input name="hosted_by" placeholder="DJ ..."></label>
+<label>Premiere — drop it later? <span class="muted">(optional — leave empty to drop NOW. If set, the tape shows a countdown, fans can sign up for a drop alert, and streaming opens at drop time.)</span>
+<input type="datetime-local" id="prem-local">
+<input type="hidden" name="release_at_utc" id="prem-utc"></label>
 <label>Description <textarea name="description" rows="3"></textarea></label>
 <label>Download mode
 <select name="download_mode">
@@ -688,7 +1045,13 @@ def upload_page(request: Request):
 <label style="display:flex;gap:8px;align-items:flex-start">
 <input type="checkbox" name="rights" value="yes" style="width:auto;margin-top:3px">
 <span>I confirm this music is mine or I have permission to post it. I keep 100% of my rights.</span></label>
-<button class="btn" type="submit">Post my mixtape — free</button></form>"""
+<button class="btn" type="submit">Post my mixtape — free</button></form>
+<script>
+document.querySelector('form').addEventListener('submit', () => {
+  const v = document.getElementById('prem-local').value;
+  document.getElementById('prem-utc').value = v ? new Date(v).toISOString() : '';
+});
+</script>"""
     return layout(request, "Upload", body, user)
 
 
@@ -696,6 +1059,7 @@ def upload_page(request: Request):
 async def upload(request: Request, title: str = Form(...), genre: str = Form(""),
                  description: str = Form(""), download_mode: str = Form("free"),
                  price: float = Form(0), rights: str = Form(None),
+                 hosted_by: str = Form(""), release_at_utc: str = Form(""),
                  cover: UploadFile = File(...), tracks: list[UploadFile] = File(...)):
     user = current_user(request)
     if not user:
@@ -737,12 +1101,22 @@ async def upload(request: Request, title: str = Form(...), genre: str = Form("")
     if download_mode == "paid" and price_cents < 50:
         return PlainTextResponse("Paid Download price must be at least $0.50.", status_code=400)
 
+    release_at = None
+    if release_at_utc.strip():
+        try:
+            dt = datetime.fromisoformat(release_at_utc.strip().replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if dt > datetime.now(timezone.utc):
+                release_at = dt.astimezone(timezone.utc).isoformat()
+        except ValueError:
+            release_at = None
     conn = get_db()
     cur = conn.execute(
-        "INSERT INTO mixtapes(artist_id,title,cover_path,genre,description,download_mode,price_cents,created_at) "
-        "VALUES(?,?,?,?,?,?,?,?)",
+        "INSERT INTO mixtapes(artist_id,title,cover_path,genre,description,download_mode,price_cents,created_at,hosted_by,release_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?)",
         (user["id"], title.strip(), "", genre.strip(), description.strip(),
-         download_mode, price_cents, now_iso()))
+         download_mode, price_cents, now_iso(), hosted_by.strip()[:60], release_at))
     tape_id = cur.lastrowid
     tape_dir = UPLOAD_ROOT / str(tape_id)
     tape_dir.mkdir(parents=True, exist_ok=True)
@@ -780,62 +1154,189 @@ def cover(tape_id: int):
 @app.get("/tape/{tape_id}")
 def tape_page(request: Request, tape_id: int):
     conn = get_db()
+    sweep_premieres(conn)
     user = current_user(request)
     row = conn.execute(
-        "SELECT m.*, u.display_name artist_name FROM mixtapes m JOIN users u ON u.id=m.artist_id WHERE m.id=?",
+        "SELECT m.*, u.display_name artist_name, u.vanity artist_vanity, u.city artist_city FROM mixtapes m JOIN users u ON u.id=m.artist_id WHERE m.id=?",
         (tape_id,)).fetchone()
     if not row or row["removed"]:
         conn.close()
         return PlainTextResponse("Mixtape not found", status_code=404)
     tape = dict(row)
+    owner = bool(user) and user["id"] == tape["artist_id"]
+    live = is_live(tape)
     golden_id = golden_tape_id(conn)
-    tracks = conn.execute("SELECT * FROM tracks WHERE tape_id=? ORDER BY track_num", (tape_id,)).fetchall()
     s = tape_stats(conn, tape_id)
     followers = conn.execute("SELECT COUNT(*) c FROM follows WHERE artist_id=?", (tape["artist_id"],)).fetchone()["c"]
+    base = site_base(request)
+    og = {"title": f"{tape['title']} — {tape['artist_name']}",
+          "desc": (f"{s['plays']} plays · {s['downloads']} downloads · {s['likes']} likes on HITZ, The Real Mixtape Connect. "
+                   f"{mode_badge(tape)}. Artists upload free and get paid — 80% of sales, 90% of tips."),
+          "image": base + f"/cover/{tape_id}",
+          "url": base + f"/tape/{tape_id}"}
+    jsonld = ("<script type=\"application/ld+json\">" + json.dumps({
+        "@context": "https://schema.org", "@type": "MusicAlbum",
+        "name": tape["title"], "byArtist": {"@type": "MusicGroup", "name": tape["artist_name"]},
+        "image": base + f"/cover/{tape_id}", "url": base + f"/tape/{tape_id}",
+        "genre": tape["genre"] or "Hip-Hop"}) + "</script>")
+    hosted_line = (f"<p class='muted'>\U0001F3A7 Hosted by {html.escape(tape['hosted_by'])}</p>"
+                   if tape.get("hosted_by") else "")
+    embed_code = (f'<iframe src="{base}/embed/{tape_id}" width="100%" height="250" frameborder="0" '
+                  f'allow="autoplay" style="border:1px solid #c9a227;border-radius:10px"></iframe>')
+    embed_section = f"""<details><summary>\U0001F4E4 Embed this tape on your site / link-in-bio</summary>
+<p class="muted">Copy this player code — every play out there still counts here, and the player sends fans back to HITZ.</p>
+<textarea class="code" id="embed-code" rows="3" readonly>{html.escape(embed_code)}</textarea>
+<button class="btn secondary small" type="button" onclick="navigator.clipboard.writeText(document.getElementById('embed-code').value).then(()=>alert('Embed code copied'))">Copy embed code</button></details>"""
+    golden_hero = ('<img class="goldentape" src="/static/golden-tape.jpg" alt="GOLDEN TAPE" '
+                   'title="GOLDEN TAPE - the most-played tape on HITZ">') if golden_id == tape_id else ""
+    golden_pill = ('<span class="badge gold">\U0001F947 GOLDEN TAPE — most plays on HITZ</span> ') if golden_id == tape_id else ""
+
+    if not live and not owner:
+        subs = conn.execute("SELECT COUNT(*) c FROM premiere_notify WHERE tape_id=?", (tape_id,)).fetchone()["c"]
+        on_list = bool(user) and bool(conn.execute(
+            "SELECT 1 FROM premiere_notify WHERE tape_id=? AND user_id=?", (tape_id, user["id"])).fetchone())
+        if not user:
+            notify_block = '<p><a class="btn" href="/login">Log in to get the drop alert</a></p>'
+        elif on_list:
+            notify_block = '<p class="ok">\u2713 You are on the list — we will alert you the second it drops.</p>'
+        else:
+            notify_block = (f'<form method="post" action="/premiere-notify/{tape_id}">'
+                            '<button class="btn" type="submit">\U0001F514 Notify Me When It Drops</button></form>')
+        countdown_js = """<script>
+const target = new Date("__REL__").getTime();
+function tick(){
+  let d = Math.max(0, target - Date.now());
+  const days = Math.floor(d/86400000), hrs = Math.floor(d%86400000/3600000),
+        min = Math.floor(d%3600000/60000), sec = Math.floor(d%60000/1000);
+  document.getElementById('cd').textContent = days + 'd ' + hrs + 'h ' + min + 'm ' + sec + 's';
+  if(d <= 0){ location.reload(); }
+}
+tick(); setInterval(tick, 1000);
+</script>""".replace("__REL__", tape["release_at"])
+        body = f"""
+<span class="tapehero"><img src="/cover/{tape_id}" alt="cover" style="width:220px;height:220px;object-fit:cover;border-radius:12px">{golden_hero}</span>
+<h1>{html.escape(tape['title'])}</h1>
+<p>by <a href="/artist/{tape['artist_id']}">{html.escape(tape['artist_name'])}</a> · {html.escape(tape['genre'] or '')} · {followers} followers</p>
+{hosted_line}
+<p><span class="badge">\U0001F552 PREMIERE</span></p>
+<p style="font-size:1.15rem">This tape drops <b class="gold">{tape['release_at'][:16].replace('T', ' ')} UTC</b></p>
+<div class="countdown" id="cd">…</div>
+<p class="muted">{subs} fan(s) waiting on this drop. Streaming opens the second it lands — no downloads or plays before drop time, for anyone.</p>
+{notify_block}
+<p>{html.escape(tape['description'] or '')}</p>
+{embed_section}
+{jsonld}
+{countdown_js}
+{SHARE_JS}"""
+        conn.close()
+        return layout(request, tape["title"], body, user, og=og)
+
+    tracks = conn.execute("SELECT * FROM tracks WHERE tape_id=? ORDER BY track_num", (tape_id,)).fetchall()
     js_tracks = json.dumps([{"id": t["id"], "title": t["title"], "artist": tape["artist_name"]} for t in tracks])
     track_lines = "".join(
-        f"""<div class="trackline"><button class="btn small" onclick='dhPlay({js_tracks},{i},{tape_id})'>▶</button>
+        f"""<div class="trackline"><button class="btn small" onclick='dhPlay({js_tracks},{i},{tape_id})'>\u25B6</button>
 <span>{i+1}. {html.escape(t['title'])}</span></div>""" for i, t in enumerate(tracks))
     if tape["download_mode"] == "stream_only":
         dl = '<p><span class="badge dark">STREAM ONLY</span> <span class="muted">Downloads are off for this tape — the artist\'s setting always wins.</span></p>'
     elif tape["download_mode"] == "free":
-        dl = (f'<p><a class="btn" href="/download/{tape_id}">⬇ Free Download</a> '
+        dl = (f'<p><a class="btn" href="/download/{tape_id}">\u2B07 Free Download</a> '
               '<span class="muted">Free Fan account required — downloading follows this artist.</span></p>')
     else:
         dl = (f'<form method="post" action="/buy-download/{tape_id}" style="display:inline">'
-              f'<button class="btn" type="submit">⬇ Buy Download — {fmt(tape["price_cents"])}</button></form> '
+              f'<button class="btn" type="submit">\u2B07 Buy Download — {fmt(tape["price_cents"])}</button></form> '
               f'<a class="btn secondary" href="/download/{tape_id}">I already paid — download</a>'
               f'<p class="muted">You keep streaming free. The artist keeps 80% (85% on Pro). {money_label()}.</p>')
-    golden_hero = ('<img class="goldentape" src="/static/golden-tape.jpg" alt="GOLDEN TAPE" '
-                   'title="GOLDEN TAPE - the most-played tape on HITZ">') if golden_id == tape_id else ""
-    golden_pill = ('<span class="badge gold">\U0001F947 GOLDEN TAPE — most plays on HITZ</span> ') if golden_id == tape_id else ""
+    premiere_banner = ""
+    if not live and owner:
+        premiere_banner = (f"<div class='ok'>\U0001F552 PREMIERE — this tape drops {tape['release_at'][:16].replace('T', ' ')} UTC. "
+                           "Only you can preview it until then.</div>")
+    vspill = ('<span class="badge gold">\u2694\uFE0F VERSUS WINNER</span> '
+              if tape_won_versus(conn, tape_id) else "")
+    # playlists: add-to-playlist form
+    playlist_block = ""
+    if user:
+        pls = conn.execute("SELECT * FROM playlists WHERE user_id=? ORDER BY created_at DESC", (user["id"],)).fetchall()
+        if pls:
+            opts = "".join(f"<option value='{p['id']}'>{html.escape(p['title'])}</option>" for p in pls)
+            playlist_block = (f'<form method="post" action="/playlist-add" style="display:inline">'
+                              f'<input type="hidden" name="tape_id" value="{tape_id}">'
+                              f'<select name="playlist_id" style="width:auto">{opts}</select>'
+                              '<button class="btn secondary small" type="submit">+ Add to playlist</button></form>')
+        else:
+            playlist_block = '<a class="btn secondary small" href="/playlists">Create a playlist</a>'
+    # versus: start-a-battle form for the owner
+    versus_block = ""
+    if owner:
+        active = conn.execute("SELECT 1 FROM battles WHERE (tape_a=? OR tape_b=?) AND ends_at>?",
+                              (tape_id, tape_id, now_iso())).fetchone()
+        if active:
+            versus_block = '<p class="muted">\u2694\uFE0F This tape is in an active Versus battle — <a href="/versus">watch it</a>.</p>'
+        else:
+            opps = conn.execute(
+                "SELECT m.id, m.title, u.display_name artist_name FROM mixtapes m JOIN users u ON u.id=m.artist_id "
+                "WHERE m.removed=0 AND m.id<>? AND (m.release_at IS NULL OR m.release_at<=?) "
+                "ORDER BY m.created_at DESC LIMIT 100", (tape_id, now_iso())).fetchall()
+            if opps:
+                opts = "".join(f"<option value='{o['id']}'>{html.escape(o['title'])} — {html.escape(o['artist_name'])}</option>" for o in opps)
+                versus_block = (f'<details><summary>\u2694\uFE0F Start a Versus battle with this tape</summary>'
+                                '<p class="muted">7 days. Fans vote. Winner takes the Versus crown on their tape. The other artist gets challenged by alert.</p>'
+                                f'<form method="post" action="/versus/start"><input type="hidden" name="tape_a" value="{tape_id}">'
+                                f'<label>Opponent tape <select name="tape_b">{opts}</select></label>'
+                                '<button class="btn small" type="submit">Start the battle</button></form></details>')
+    # comments
+    comment_rows = conn.execute(
+        "SELECT c.*, u.display_name FROM comments c JOIN users u ON u.id=c.user_id "
+        "WHERE c.tape_id=? ORDER BY c.created_at DESC LIMIT 100", (tape_id,)).fetchall()
+    comment_lines = ""
+    for c in comment_rows:
+        del_form = (f'<form method="post" action="/comment/{c["id"]}/delete" style="display:inline">'
+                    '<button class="btn secondary small" type="submit">Delete</button></form>'
+                    if user and c["user_id"] == user["id"] else "")
+        comment_lines += (f"<div class='card' style='margin:8px 0'><b>{html.escape(c['display_name'])}</b> "
+                          f"<span class='muted'>{html.escape(c['created_at'][:10])}</span>"
+                          f"<p style='margin:6px 0'>{html.escape(c['body'])}</p>{del_form}</div>")
+    if user:
+        comment_form = (f'<form method="post" action="/comment/{tape_id}">'
+                        '<label>Say something <input name="body" maxlength="500" required placeholder="This tape is..."></label>'
+                        '<button class="btn small" type="submit">Post comment</button></form>')
+    else:
+        comment_form = '<p class="muted"><a href="/login">Log in</a> to comment.</p>'
     body = f"""
 <span class="tapehero"><img src="/cover/{tape_id}" alt="cover" style="width:220px;height:220px;object-fit:cover;border-radius:12px">{golden_hero}</span>
 <h1>{html.escape(tape['title'])}</h1>
 <p>by <a href="/artist/{tape['artist_id']}">{html.escape(tape['artist_name'])}</a> · {html.escape(tape['genre'] or '')} · {followers} followers</p>
-<p>{golden_pill}<span class="badge dark">{mode_badge(tape)}</span></p>
+{hosted_line}
+{premiere_banner}
+<p>{golden_pill}{vspill}<span class="badge dark">{mode_badge(tape)}</span></p>
 <p class="muted" data-plays="{s['plays']}" data-downloads="{s['downloads']}" data-likes="{s['likes']}">
-▶ {s['plays']} plays · ⬇ {s['downloads']} downloads · ♥ {s['likes']} likes</p>
+\u25B6 {s['plays']} plays · \u2B07 {s['downloads']} downloads · \u2665 {s['likes']} likes</p>
 <p>{html.escape(tape['description'] or '')}</p>
 {track_lines}
 <div style="margin:16px 0">{dl}</div>
-<div style="display:flex;gap:8px;flex-wrap:wrap;margin:14px 0">
-<form method="post" action="/like/{tape_id}"><button class="btn secondary small" type="submit">♥ Like</button></form>
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin:14px 0;align-items:center">
+<form method="post" action="/like/{tape_id}"><button class="btn secondary small" type="submit">\u2665 Like</button></form>
 <form method="post" action="/follow/{tape['artist_id']}"><button class="btn secondary small" type="submit">Follow Artist</button></form>
 <button class="btn secondary small" onclick="dhShare('{html.escape(tape['artist_name'], quote=True)}','{html.escape(tape['title'], quote=True)}')">Share</button>
+{playlist_block}
 </div>
+{embed_section}
+{versus_block}
 <h3>Tip the artist — they keep 90%</h3>
 <form method="post" action="/tip/{tape_id}">
 <label>Tip amount ($) <input name="amount" type="number" step="0.5" min="0.5" value="5" style="max-width:160px"></label>
 <button class="btn small" type="submit">Tip $1 / $5 / $10 — any amount</button>
 <span class="muted">{money_label()}.</span></form>
+<h3 style="margin-top:22px">Comments</h3>
+{comment_form}
+{comment_lines or '<p class="muted">No comments yet — start the conversation.</p>'}
 <h3 style="margin-top:22px">Report</h3>
 <form method="post" action="/report/{tape_id}">
 <label>Reason (copyright / DMCA / other) <input name="reason" required></label>
 <button class="btn secondary small" type="submit">Report this tape</button></form>
+{jsonld}
 {SHARE_JS}"""
     conn.close()
-    return layout(request, tape["title"], body, user)
+    return layout(request, tape["title"], body, user, og=og)
 
 
 @app.get("/artist/{artist_id}")
@@ -850,19 +1351,338 @@ def artist_page(request: Request, artist_id: int):
     winner_id = weekly[0][1]["id"] if weekly and weekly[0][0] > 0 else None
     golden_id = golden_tape_id(conn)
     tapes = conn.execute(
-        "SELECT m.*, u.display_name artist_name FROM mixtapes m JOIN users u ON u.id=m.artist_id "
+        "SELECT m.*, u.display_name artist_name, u.vanity artist_vanity, u.city artist_city FROM mixtapes m JOIN users u ON u.id=m.artist_id "
         "WHERE m.artist_id=? AND m.removed=0 ORDER BY m.created_at DESC", (artist_id,)).fetchall()
     followers = conn.execute("SELECT COUNT(*) c FROM follows WHERE artist_id=?", (artist_id,)).fetchone()["c"]
     cards = "".join(tape_card(conn, dict(t), winner_id, golden_id) for t in tapes) or "<p class='muted'>No tapes yet.</p>"
     pro = ' <span class="badge">PRO ✓ VERIFIED</span>' if a["is_pro"] else ""
+    city_html = (f"<p class='muted'>\U0001F4CD <a href='/city/{slugify(a['city'])}'>{html.escape(a['city'])}</a></p>"
+                 if a["city"] else "")
+    vanity_html = (f"<p class='muted'>\U0001F517 hitzmixtapes.com/@{html.escape(a['vanity'])}</p>"
+                   if a["vanity"] else "")
     body = f"""<h1>{html.escape(a['display_name'])}{pro}</h1>
+{city_html}{vanity_html}
 <p class="muted">{followers} followers</p>
 <form method="post" action="/follow/{artist_id}"><button class="btn small" type="submit">Follow Artist</button></form>
 <form method="post" action="/subscribe/{artist_id}" style="margin-top:8px">
 <button class="btn secondary small" type="submit">Subscribe — {fmt(SUB_PRICE_CENTS)}/mo (artist keeps 80%)</button></form>
 <h2>Tapes</h2><div class="grid">{cards}</div>{SHARE_JS}"""
     conn.close()
-    return layout(request, a["display_name"], body)
+    base = site_base(request)
+    og = {"title": f"{a['display_name']} — HITZ",
+          "desc": f"{a['display_name']} on HITZ, The Real Mixtape Connect. {followers} followers. Stream the tapes free.",
+          "image": base + "/static/hitz-logo.jpg",
+          "url": base + (f"/@{a['vanity']}" if a["vanity"] else f"/artist/{artist_id}")}
+    return layout(request, a["display_name"], body, og=og)
+
+
+
+# ---------------------------------------------------------------- comments / playlists / premieres / versus
+@app.post("/premiere-notify/{tape_id}")
+def premiere_notify_route(request: Request, tape_id: int):
+    user, redir = require_login(request)
+    if redir:
+        return redir
+    conn = get_db()
+    conn.execute("INSERT OR IGNORE INTO premiere_notify(tape_id,user_id,created_at) VALUES(?,?,?)",
+                 (tape_id, user["id"], now_iso()))
+    conn.commit()
+    conn.close()
+    return RedirectResponse(f"/tape/{tape_id}", status_code=303)
+
+
+@app.post("/comment/{tape_id}")
+def comment(request: Request, tape_id: int, body: str = Form(...)):
+    user, redir = require_login(request)
+    if redir:
+        return redir
+    text = body.strip()
+    if not text or len(text) > 500:
+        return PlainTextResponse("Comment must be 1-500 characters.", status_code=400)
+    conn = get_db()
+    tape = conn.execute("SELECT * FROM mixtapes WHERE id=? AND removed=0", (tape_id,)).fetchone()
+    if not tape:
+        conn.close()
+        return PlainTextResponse("Mixtape not found", status_code=404)
+    if not is_live(dict(tape)) and tape["artist_id"] != user["id"]:
+        conn.close()
+        return PlainTextResponse("Comments open when this tape drops.", status_code=403)
+    conn.execute("INSERT INTO comments(tape_id,user_id,body,created_at) VALUES(?,?,?,?)",
+                 (tape_id, user["id"], text, now_iso()))
+    conn.commit()
+    conn.close()
+    return RedirectResponse(f"/tape/{tape_id}", status_code=303)
+
+
+@app.post("/comment/{comment_id}/delete")
+def comment_delete(request: Request, comment_id: int):
+    user, redir = require_login(request)
+    if redir:
+        return redir
+    conn = get_db()
+    c = conn.execute("SELECT * FROM comments WHERE id=?", (comment_id,)).fetchone()
+    if not c:
+        conn.close()
+        return PlainTextResponse("Comment not found", status_code=404)
+    if c["user_id"] != user["id"]:
+        conn.close()
+        return PlainTextResponse("You can only delete your own comments.", status_code=403)
+    conn.execute("DELETE FROM comments WHERE id=?", (comment_id,))
+    conn.commit()
+    conn.close()
+    return RedirectResponse(f"/tape/{c['tape_id']}", status_code=303)
+
+
+@app.get("/playlists")
+def playlists_page(request: Request):
+    user, redir = require_login(request)
+    if redir:
+        return redir
+    conn = get_db()
+    mine = conn.execute(
+        "SELECT p.*, (SELECT COUNT(*) FROM playlist_items i WHERE i.playlist_id=p.id) n "
+        "FROM playlists p WHERE p.user_id=? ORDER BY p.created_at DESC", (user["id"],)).fetchall()
+    others = conn.execute(
+        "SELECT p.*, u.display_name owner_name, (SELECT COUNT(*) FROM playlist_items i WHERE i.playlist_id=p.id) n "
+        "FROM playlists p JOIN users u ON u.id=p.user_id WHERE p.user_id<>? ORDER BY p.created_at DESC LIMIT 12",
+        (user["id"],)).fetchall()
+    conn.close()
+    my_lines = "".join(
+        f"<div class='card' style='margin:8px 0'><a href='/playlist/{p['id']}'><b>{html.escape(p['title'])}</b></a> "
+        f"<span class='muted'>{p['n']} tape(s)</span></div>" for p in mine)
+    other_lines = "".join(
+        f"<div class='card' style='margin:8px 0'><a href='/playlist/{p['id']}'><b>{html.escape(p['title'])}</b></a> "
+        f"<span class='muted'>by {html.escape(p['owner_name'])} · {p['n']} tape(s)</span></div>" for p in others)
+    body = f"""<h1>Playlists</h1>
+<form method="post" action="/playlists"><label>New playlist name <input name="title" required maxlength="80"></label>
+<button class="btn small" type="submit">Create playlist</button></form>
+<h2>Your playlists</h2>{my_lines or '<p class="muted">None yet — create one, then add tapes from any tape page.</p>'}
+<h2 style="margin-top:26px">Fresh from other fans</h2>{other_lines or '<p class="muted">No public playlists yet.</p>'}"""
+    return layout(request, "Playlists", body, user)
+
+
+@app.post("/playlists")
+def playlists_create(request: Request, title: str = Form(...)):
+    user, redir = require_login(request)
+    if redir:
+        return redir
+    conn = get_db()
+    conn.execute("INSERT INTO playlists(user_id,title,created_at) VALUES(?,?,?)",
+                 (user["id"], title.strip()[:80], now_iso()))
+    conn.commit()
+    conn.close()
+    return RedirectResponse("/playlists", status_code=303)
+
+
+@app.get("/playlist/{playlist_id}")
+def playlist_page(request: Request, playlist_id: int):
+    user = current_user(request)
+    conn = get_db()
+    sweep_premieres(conn)
+    p = conn.execute("SELECT p.*, u.display_name owner_name FROM playlists p JOIN users u ON u.id=p.user_id WHERE p.id=?",
+                     (playlist_id,)).fetchone()
+    if not p:
+        conn.close()
+        return PlainTextResponse("Playlist not found", status_code=404)
+    rows = conn.execute(
+        "SELECT m.*, u.display_name artist_name, u.vanity artist_vanity, u.city artist_city "
+        "FROM playlist_items i JOIN mixtapes m ON m.id=i.tape_id JOIN users u ON u.id=m.artist_id "
+        "WHERE i.playlist_id=? AND m.removed=0 ORDER BY i.created_at", (playlist_id,)).fetchall()
+    weekly = chart_rows(conn, since_iso=(datetime.now(timezone.utc) - timedelta(days=7)).isoformat(), limit=50)
+    winner_id = weekly[0][1]["id"] if weekly and weekly[0][0] > 0 else None
+    golden_id = golden_tape_id(conn)
+    cards = "".join(tape_card(conn, dict(r), winner_id, golden_id) for r in rows)
+    owner = bool(user) and user["id"] == p["user_id"]
+    manage = ""
+    if owner:
+        items = "".join(
+            f"<form method='post' action='/playlist-remove' style='display:inline-block;margin:3px'>"
+            f"<input type='hidden' name='playlist_id' value='{playlist_id}'><input type='hidden' name='tape_id' value='{r['id']}'>"
+            f"<button class='btn secondary small' type='submit'>Remove '{html.escape(r['title'])}'</button></form>" for r in rows)
+        manage = (f"<h3>Manage</h3>{items}"
+                  f"<form method='post' action='/playlist-delete' style='margin-top:10px'>"
+                  f"<input type='hidden' name='playlist_id' value='{playlist_id}'>"
+                  "<button class='btn secondary small' type='submit'>Delete this playlist</button></form>")
+    base = site_base(request)
+    conn.close()
+    body = f"""<h1>{html.escape(p['title'])}</h1>
+<p class="muted">Playlist by {html.escape(p['owner_name'])} · {len(rows)} tape(s) · Share it: {base}/playlist/{playlist_id}</p>
+<div class="grid">{cards or '<p class="muted">No tapes yet.</p>'}</div>
+{manage}{SHARE_JS}"""
+    return layout(request, p["title"], body, user)
+
+
+@app.post("/playlist-add")
+def playlist_add(request: Request, playlist_id: int = Form(...), tape_id: int = Form(...)):
+    user, redir = require_login(request)
+    if redir:
+        return redir
+    conn = get_db()
+    p = conn.execute("SELECT * FROM playlists WHERE id=?", (playlist_id,)).fetchone()
+    if not p or p["user_id"] != user["id"]:
+        conn.close()
+        return PlainTextResponse("That is not your playlist.", status_code=403)
+    conn.execute("INSERT OR IGNORE INTO playlist_items(playlist_id,tape_id,created_at) VALUES(?,?,?)",
+                 (playlist_id, tape_id, now_iso()))
+    conn.commit()
+    conn.close()
+    return RedirectResponse(f"/tape/{tape_id}", status_code=303)
+
+
+@app.post("/playlist-remove")
+def playlist_remove(request: Request, playlist_id: int = Form(...), tape_id: int = Form(...)):
+    user, redir = require_login(request)
+    if redir:
+        return redir
+    conn = get_db()
+    p = conn.execute("SELECT * FROM playlists WHERE id=?", (playlist_id,)).fetchone()
+    if not p or p["user_id"] != user["id"]:
+        conn.close()
+        return PlainTextResponse("That is not your playlist.", status_code=403)
+    conn.execute("DELETE FROM playlist_items WHERE playlist_id=? AND tape_id=?", (playlist_id, tape_id))
+    conn.commit()
+    conn.close()
+    return RedirectResponse(f"/playlist/{playlist_id}", status_code=303)
+
+
+@app.post("/playlist-delete")
+def playlist_delete(request: Request, playlist_id: int = Form(...)):
+    user, redir = require_login(request)
+    if redir:
+        return redir
+    conn = get_db()
+    p = conn.execute("SELECT * FROM playlists WHERE id=?", (playlist_id,)).fetchone()
+    if not p or p["user_id"] != user["id"]:
+        conn.close()
+        return PlainTextResponse("That is not your playlist.", status_code=403)
+    conn.execute("DELETE FROM playlist_items WHERE playlist_id=?", (playlist_id,))
+    conn.execute("DELETE FROM playlists WHERE id=?", (playlist_id,))
+    conn.commit()
+    conn.close()
+    return RedirectResponse("/playlists", status_code=303)
+
+
+@app.get("/versus")
+def versus_page(request: Request):
+    user = current_user(request)
+    conn = get_db()
+    sweep_battles(conn)
+    battles = conn.execute("SELECT * FROM battles ORDER BY created_at DESC LIMIT 30").fetchall()
+
+    def side(b, tid, votes, my_vote):
+        t = conn.execute(
+            "SELECT m.*, u.display_name artist_name FROM mixtapes m JOIN users u ON u.id=m.artist_id WHERE m.id=?",
+            (tid,)).fetchone()
+        if not t:
+            return "<div class='card'>Tape removed</div>"
+        total = max(1, votes.get(b["tape_a"], 0) + votes.get(b["tape_b"], 0))
+        pct = round(100 * votes.get(tid, 0) / total)
+        active = b["ends_at"] > now_iso()
+        winner = battle_winner(conn, b)
+        crown = " \U0001F3C6 WINNER" if winner == tid else ""
+        if not user:
+            btn = '<a class="btn small" href="/login">Log in to vote</a>'
+        elif not active:
+            btn = '<span class="muted">Voting closed</span>'
+        elif my_vote == tid:
+            btn = '<span class="badge gold">\u2713 Your pick</span>'
+        elif my_vote:
+            btn = '<span class="muted">You voted for the other tape</span>'
+        else:
+            btn = (f'<form method="post" action="/versus/{b["id"]}/vote">'
+                   f'<input type="hidden" name="tape_id" value="{tid}">'
+                   '<button class="btn small" type="submit">Vote</button></form>')
+        return (f"<div class='card' style='flex:1;min-width:230px'>"
+                f"<a href='/tape/{tid}'><img class='cover' src='/cover/{tid}' alt='cover' style='width:100%;aspect-ratio:1;object-fit:cover;border-radius:8px'></a>"
+                f"<div style='margin-top:8px'><a href='/tape/{tid}' style='font-weight:800;color:#fff'>{html.escape(t['title'])}</a>{crown}</div>"
+                f"<div class='muted'>by {html.escape(t['artist_name'])}</div>"
+                f"<div style='font-size:1.25rem;margin-top:6px'><b class='gold'>{votes.get(tid, 0)}</b> votes</div>"
+                f"<div class='bar'><i style='width:{pct}%'></i></div>{btn}</div>")
+
+    active_html, done_html = "", ""
+    for b in battles:
+        votes = battle_votes(conn, b["id"])
+        my_vote = None
+        if user:
+            v = conn.execute("SELECT tape_id FROM battle_votes WHERE battle_id=? AND user_id=?",
+                             (b["id"], user["id"])).fetchone()
+            my_vote = v["tape_id"] if v else None
+        block = (f"<div style='display:flex;gap:14px;flex-wrap:wrap;margin:14px 0'>"
+                 f"{side(b, b['tape_a'], votes, my_vote)}"
+                 f"<div style='align-self:center;font-weight:800;font-size:1.3rem' class='gold'>VS</div>"
+                 f"{side(b, b['tape_b'], votes, my_vote)}</div>")
+        if b["ends_at"] > now_iso():
+            active_html += f"<p class='muted'>Ends {b['ends_at'][:10]} — one vote per fan. Make it count.</p>" + block
+        else:
+            w = battle_winner(conn, b)
+            verdict = "Ended in a TIE" if not w else "Winner decided"
+            done_html += f"<p class='muted'>{verdict} · ended {b['ends_at'][:10]}</p>" + block
+    conn.close()
+    body = f"""<h1>\u2694\uFE0F Versus Battles</h1>
+<p>Two tapes. Seven days. Fans vote. The winner wears the Versus crown on their tape — and both artists get a crowd they didn't have before. Artists start a battle from their own tape page.</p>
+<h2>Live battles</h2>{active_html or '<p class="muted">No live battles right now — an artist can start one from their tape page.</p>'}
+<h2 style="margin-top:28px">Finished</h2>{done_html or '<p class="muted">No finished battles yet.</p>'}"""
+    return layout(request, "Versus", body, user)
+
+
+@app.post("/versus/start")
+def versus_start(request: Request, tape_a: int = Form(...), tape_b: int = Form(...)):
+    user, redir = require_login(request)
+    if redir:
+        return redir
+    if tape_a == tape_b:
+        return PlainTextResponse("A tape cannot battle itself.", status_code=400)
+    conn = get_db()
+    a = conn.execute("SELECT * FROM mixtapes WHERE id=? AND removed=0", (tape_a,)).fetchone()
+    b = conn.execute("SELECT * FROM mixtapes WHERE id=? AND removed=0", (tape_b,)).fetchone()
+    if not a or not b:
+        conn.close()
+        return PlainTextResponse("Tape not found", status_code=404)
+    if a["artist_id"] != user["id"]:
+        conn.close()
+        return PlainTextResponse("You can only send YOUR tape into battle.", status_code=403)
+    if not is_live(dict(a)) or not is_live(dict(b)):
+        conn.close()
+        return PlainTextResponse("Both tapes must be live (not premieres) to battle.", status_code=400)
+    busy = conn.execute(
+        "SELECT 1 FROM battles WHERE ends_at>? AND (tape_a IN (?,?) OR tape_b IN (?,?))",
+        (now_iso(), tape_a, tape_b, tape_a, tape_b)).fetchone()
+    if busy:
+        conn.close()
+        return PlainTextResponse("One of these tapes is already in an active battle.", status_code=400)
+    ends = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+    cur = conn.execute("INSERT INTO battles(tape_a,tape_b,created_by,ends_at,created_at) VALUES(?,?,?,?,?)",
+                       (tape_a, tape_b, user["id"], ends, now_iso()))
+    notify(conn, b["artist_id"],
+           f"\u2694\uFE0F CHALLENGE: '{a['title']}' just called out your tape '{b['title']}' — 7-day Versus battle is LIVE!",
+           tape_b)
+    conn.commit()
+    conn.close()
+    return RedirectResponse("/versus", status_code=303)
+
+
+@app.post("/versus/{battle_id}/vote")
+def versus_vote(request: Request, battle_id: int, tape_id: int = Form(...)):
+    user, redir = require_login(request)
+    if redir:
+        return redir
+    conn = get_db()
+    b = conn.execute("SELECT * FROM battles WHERE id=?", (battle_id,)).fetchone()
+    if not b:
+        conn.close()
+        return PlainTextResponse("Battle not found", status_code=404)
+    if b["ends_at"] <= now_iso():
+        conn.close()
+        return PlainTextResponse("Voting has closed for this battle.", status_code=400)
+    if tape_id not in (b["tape_a"], b["tape_b"]):
+        conn.close()
+        return PlainTextResponse("That tape is not in this battle.", status_code=400)
+    conn.execute("INSERT OR IGNORE INTO battle_votes(battle_id,user_id,tape_id,created_at) VALUES(?,?,?,?)",
+                 (battle_id, user["id"], tape_id, now_iso()))
+    conn.commit()
+    conn.close()
+    return RedirectResponse("/versus", status_code=303)
+
 
 
 # ---------------------------------------------------------------- streaming / plays
@@ -882,11 +1702,17 @@ def iter_file_range(path: Path, start: int, end: int, chunk=64 * 1024):
 def stream(request: Request, track_id: int):
     conn = get_db()
     row = conn.execute(
-        "SELECT t.*, m.removed FROM tracks t JOIN mixtapes m ON m.id=t.tape_id WHERE t.id=?",
+        "SELECT t.*, m.removed, m.release_at, m.artist_id FROM tracks t JOIN mixtapes m ON m.id=t.tape_id WHERE t.id=?",
         (track_id,)).fetchone()
     conn.close()
     if not row or row["removed"]:
         return PlainTextResponse("Track not found", status_code=404)
+    if row["release_at"] and row["release_at"] > now_iso():
+        viewer = current_user(request)
+        if not viewer or viewer["id"] != row["artist_id"]:
+            return PlainTextResponse(
+                f"This tape premieres on {row['release_at'][:10]} — streaming opens when it drops.",
+                status_code=403)
     path = Path(row["file_path"])
     if not path.exists():
         return PlainTextResponse("Audio file missing", status_code=404)
@@ -917,10 +1743,13 @@ def record_play(request: Request, tape_id: int):
     user = current_user(request)
     key = listener_key(request, user)
     conn = get_db()
-    tape = conn.execute("SELECT id FROM mixtapes WHERE id=? AND removed=0", (tape_id,)).fetchone()
+    tape = conn.execute("SELECT id, release_at FROM mixtapes WHERE id=? AND removed=0", (tape_id,)).fetchone()
     if not tape:
         conn.close()
         return JSONResponse({"counted": False}, status_code=404)
+    if tape["release_at"] and tape["release_at"] > now_iso():
+        conn.close()
+        return JSONResponse({"counted": False, "premiere": True}, status_code=403)
     exists = conn.execute(
         "SELECT 1 FROM events WHERE tape_id=? AND kind='play' AND listener_key=? AND day=?",
         (tape_id, key, today_str())).fetchone()
@@ -977,6 +1806,11 @@ def download(request: Request, tape_id: int):
         conn.close()
         return PlainTextResponse("Mixtape not found", status_code=404)
     tape = dict(tape)
+    if not is_live(tape):
+        conn.close()
+        return PlainTextResponse(
+            f"This tape has not dropped yet — it premieres on {tape['release_at'][:10]}.",
+            status_code=403)
     if tape["download_mode"] == "stream_only":
         conn.close()
         return PlainTextResponse(
@@ -1260,6 +2094,12 @@ def dashboard(request: Request):
 <div class="card"><h3>Followers</h3><p style="font-size:1.5rem" data-followers="{followers}">{followers}</p></div>
 </div>
 {pro_nudge}
+<h2>Your profile</h2>
+<div class="card"><form method="post" action="/profile">
+<label>City / hometown <input name="city" value="{html.escape(user['city'] or '')}" placeholder="Chicago, IL"></label>
+{'<label>Your vanity link — hitzmixtapes.com/@<input name="vanity" value="' + html.escape(user['vanity'] or '') + '" placeholder="yourname" style="max-width:220px"></label>' if user['role'] == 'artist' else ''}
+<button class="btn small" type="submit">Save profile</button></form>
+{f"<p class='muted'>Your link: <b>hitzmixtapes.com/@{html.escape(user['vanity'])}</b> — put it in your bio everywhere.</p>" if user['role'] == 'artist' and user['vanity'] else ''}</div>
 <h2>Optional upgrades</h2>
 <div style="display:flex;gap:8px;flex-wrap:wrap">
 <form method="post" action="/pro-request"><button class="btn secondary" type="submit">Artist Pro — {fmt(PRO_PRICE_CENTS)}/mo (optional)</button></form>
@@ -1333,7 +2173,7 @@ def admin_overview(request: Request):
         "SELECT rp.*, m.title FROM reports rp JOIN mixtapes m ON m.id=rp.tape_id "
         "WHERE rp.status='open' ORDER BY rp.created_at").fetchall()
     tapes = conn.execute(
-        "SELECT m.*, u.display_name artist_name FROM mixtapes m JOIN users u ON u.id=m.artist_id "
+        "SELECT m.*, u.display_name artist_name, u.vanity artist_vanity, u.city artist_city FROM mixtapes m JOIN users u ON u.id=m.artist_id "
         "WHERE m.removed=0 ORDER BY m.created_at DESC").fetchall()
     users = conn.execute("SELECT * FROM users ORDER BY created_at DESC LIMIT 25").fetchall()
     data = {
@@ -1350,6 +2190,7 @@ def admin_overview(request: Request):
             "downloads": count("SELECT COUNT(*) c FROM events WHERE kind='download'"),
             "likes": count("SELECT COUNT(*) c FROM likes"),
             "follows": count("SELECT COUNT(*) c FROM follows"),
+            "comments": count("SELECT COUNT(*) c FROM comments"),
             "open_reports": len(reports),
             "sponsored_active": len(sponsored_active(conn)),
             "sponsored_max": SPONSORED_MAX_ACTIVE,
