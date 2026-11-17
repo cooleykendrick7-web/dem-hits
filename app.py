@@ -217,6 +217,13 @@ def chart_rows(conn, since_iso=None, limit=50):
     return out[:limit]
 
 
+def golden_tape_id(conn):
+    """The GOLDEN TAPE: the all-time #1 tape by chart score
+    (plays + 2x downloads + 3x likes), only once it has real activity."""
+    rows = chart_rows(conn, limit=1)
+    return rows[0][1]["id"] if rows and rows[0][0] > 0 else None
+
+
 def sponsored_active(conn):
     return conn.execute(
         "SELECT t.*, m.title tape_title FROM transactions t LEFT JOIN mixtapes m ON m.id=t.tape_id "
@@ -259,6 +266,12 @@ h1,h2,h3{color:#e8c15a}
 .card img.cover{width:100%;aspect-ratio:1;object-fit:cover;border-radius:8px;background:#222}
 .badge{display:inline-block;background:#c9a227;color:#000;font-weight:700;font-size:.72rem;padding:3px 8px;border-radius:20px;margin:4px 4px 0 0}
 .badge.silver{background:#cfd2d6}.badge.dark{background:#222;color:#e8c15a;border:1px solid #c9a227}
+.badge.gold{background:linear-gradient(180deg,#f3d27a,#c9a227);color:#000;border:1px solid #8a6d00}
+.coverwrap{position:relative}
+.goldentape{position:absolute;left:-8px;top:14px;width:78px;height:auto;transform:rotate(-10deg);border-radius:6px;box-shadow:0 4px 10px rgba(0,0,0,.65);z-index:3;pointer-events:none}
+.gt-mini{height:22px;width:auto;vertical-align:middle;transform:rotate(-8deg);margin-right:6px;border-radius:3px}
+.tapehero{position:relative;display:inline-block}
+.tapehero .goldentape{width:104px;left:-14px;top:16px}
 .btn{display:inline-block;background:linear-gradient(180deg,#f4d878,#c9a227);color:#000;font-weight:700;border:none;padding:9px 16px;border-radius:8px;cursor:pointer;font-size:.95rem}
 .btn.secondary{background:#222;color:#e8c15a;border:1px solid #c9a227}
 .btn.small{padding:5px 10px;font-size:.85rem}
@@ -359,7 +372,7 @@ def layout(request: Request, title: str, body: str, user=None) -> HTMLResponse:
     return HTMLResponse(page)
 
 
-def tape_card(conn, tape, winner_id=None) -> str:
+def tape_card(conn, tape, winner_id=None, golden_id=None) -> str:
     s = tape_stats(conn, tape["id"])
     cover = f"/cover/{tape['id']}" if tape["cover_path"] else "/static/hitz-logo.jpg"
     winner = '<span class="badge">🏆 CHART WINNER</span>' if winner_id == tape["id"] else ""
@@ -367,11 +380,14 @@ def tape_card(conn, tape, winner_id=None) -> str:
         "SELECT 1 FROM transactions WHERE tape_id=? AND kind='sponsored' AND status='paid' "
         "AND (expires_at IS NULL OR expires_at>?)", (tape["id"], now_iso())).fetchone()
     sp = '<span class="badge silver">SPONSORED</span>' if sponsored else ""
+    golden = ('<img class="goldentape" src="/static/golden-tape.jpg" alt="GOLDEN TAPE" '
+              'title="GOLDEN TAPE - the most-played tape on HITZ">') if golden_id == tape["id"] else ""
+    goldpill = '<span class="badge gold">\U0001F947 GOLDEN TAPE</span>' if golden_id == tape["id"] else ""
     return f"""<div class="card">
-<a href="/tape/{tape['id']}"><img class="cover" src="{cover}" alt="cover"></a>
+<div class="coverwrap"><a href="/tape/{tape['id']}"><img class="cover" src="{cover}" alt="cover"></a>{golden}</div>
 <div style="margin-top:8px"><a href="/tape/{tape['id']}" style="font-weight:800;color:#fff">{html.escape(tape['title'])}</a></div>
 <div class="muted">by <a href="/artist/{tape['artist_id']}">{html.escape(tape['artist_name'])}</a> · {html.escape(tape['genre'] or '')}</div>
-<div><span class="badge dark">{mode_badge(tape)}</span>{winner}{sp}</div>
+<div><span class="badge dark">{mode_badge(tape)}</span>{winner}{goldpill}{sp}</div>
 <div class="muted" style="margin-top:6px" data-plays="{s['plays']}" data-downloads="{s['downloads']}" data-likes="{s['likes']}">
 ▶ {s['plays']} plays · ⬇ {s['downloads']} downloads · ♥ {s['likes']} likes</div>
 <button class="btn small" style="margin-top:8px" onclick="dhShare('{html.escape(tape['artist_name'], quote=True)}','{html.escape(tape['title'], quote=True)}')">Share</button>
@@ -416,17 +432,18 @@ def home(request: Request):
     week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
     weekly = chart_rows(conn, since_iso=week_ago, limit=1)
     winner_id = weekly[0][1]["id"] if weekly and weekly[0][0] > 0 else None
+    golden_id = golden_tape_id(conn)
     sponsored = sponsored_active(conn)
     sp_ids = [r["tape_id"] for r in sponsored]
-    cards = "".join(tape_card(conn, dict(t), winner_id) for t in latest)
-    trend_cards = "".join(tape_card(conn, t, winner_id) for _, t, _ in trending if t["id"] not in [x["id"] for x in latest])
+    cards = "".join(tape_card(conn, dict(t), winner_id, golden_id) for t in latest)
+    trend_cards = "".join(tape_card(conn, t, winner_id, golden_id) for _, t, _ in trending if t["id"] not in [x["id"] for x in latest])
     sp_cards = ""
     if sp_ids:
         rows = conn.execute(
             "SELECT m.*, u.display_name artist_name FROM mixtapes m JOIN users u ON u.id=m.artist_id "
             f"WHERE m.id IN ({','.join('?' * len(sp_ids))})", sp_ids).fetchall()
         sp_cards = ("<h2>Sponsored</h2><div class='grid'>" +
-                    "".join(tape_card(conn, dict(r), winner_id) for r in rows) + "</div>")
+                    "".join(tape_card(conn, dict(r), winner_id, golden_id) for r in rows) + "</div>")
     conn.close()
     if not latest:
         empty = """<div class="card" style="text-align:center;padding:28px">
@@ -456,19 +473,23 @@ def charts(request: Request):
     alltime = chart_rows(conn, limit=20)
     winner_id = weekly[0][1]["id"] if weekly and weekly[0][0] > 0 else None
 
-    def rows(data):
+    golden_id = golden_tape_id(conn)
+
+    def rows(data, mark_golden=False):
         if not data or all(s == 0 for s, _, _ in data):
             return "<p class='muted'>No chart activity yet — be the first.</p>"
         trs = ""
         for i, (score, t, s) in enumerate(data, 1):
-            trs += (f"<tr><td>{i}</td><td><a href='/tape/{t['id']}'>{html.escape(t['title'])}</a>"
+            gt = ("<img class='gt-mini' src='/static/golden-tape.jpg' alt='GOLDEN TAPE' "
+                  "title='GOLDEN TAPE'>") if (mark_golden and t['id'] == golden_id) else ""
+            trs += (f"<tr><td>{i}</td><td>{gt}<a href='/tape/{t['id']}'>{html.escape(t['title'])}</a>"
                     f"{' 🏆' if t['id'] == winner_id else ''}</td>"
                     f"<td><a href='/artist/{t['artist_id']}'>{html.escape(t['artist_name'])}</a></td>"
                     f"<td>{mode_badge(t)}</td><td>{s['plays']}</td><td>{s['downloads']}</td><td>{s['likes']}</td></tr>")
         return ("<table><tr><th>#</th><th>Tape</th><th>Artist</th><th>Mode</th>"
                 "<th>Plays</th><th>Downloads</th><th>Likes</th></tr>" + trs + "</table>")
 
-    body = f"<h1>Charts</h1><h2>Top This Week</h2>{rows(weekly)}<h2 style='margin-top:30px'>Top All-Time</h2>{rows(alltime)}{SHARE_JS}"
+    body = f"<h1>Charts</h1><h2>Top This Week</h2>{rows(weekly)}<h2 style='margin-top:30px'>Top All-Time</h2>{rows(alltime, mark_golden=True)}{SHARE_JS}"
     conn.close()
     return layout(request, "Charts", body)
 
@@ -767,6 +788,7 @@ def tape_page(request: Request, tape_id: int):
         conn.close()
         return PlainTextResponse("Mixtape not found", status_code=404)
     tape = dict(row)
+    golden_id = golden_tape_id(conn)
     tracks = conn.execute("SELECT * FROM tracks WHERE tape_id=? ORDER BY track_num", (tape_id,)).fetchall()
     s = tape_stats(conn, tape_id)
     followers = conn.execute("SELECT COUNT(*) c FROM follows WHERE artist_id=?", (tape["artist_id"],)).fetchone()["c"]
@@ -784,11 +806,14 @@ def tape_page(request: Request, tape_id: int):
               f'<button class="btn" type="submit">⬇ Buy Download — {fmt(tape["price_cents"])}</button></form> '
               f'<a class="btn secondary" href="/download/{tape_id}">I already paid — download</a>'
               f'<p class="muted">You keep streaming free. The artist keeps 80% (85% on Pro). {money_label()}.</p>')
+    golden_hero = ('<img class="goldentape" src="/static/golden-tape.jpg" alt="GOLDEN TAPE" '
+                   'title="GOLDEN TAPE - the most-played tape on HITZ">') if golden_id == tape_id else ""
+    golden_pill = ('<span class="badge gold">\U0001F947 GOLDEN TAPE — most plays on HITZ</span> ') if golden_id == tape_id else ""
     body = f"""
-<img src="/cover/{tape_id}" alt="cover" style="width:220px;height:220px;object-fit:cover;border-radius:12px">
+<span class="tapehero"><img src="/cover/{tape_id}" alt="cover" style="width:220px;height:220px;object-fit:cover;border-radius:12px">{golden_hero}</span>
 <h1>{html.escape(tape['title'])}</h1>
 <p>by <a href="/artist/{tape['artist_id']}">{html.escape(tape['artist_name'])}</a> · {html.escape(tape['genre'] or '')} · {followers} followers</p>
-<p><span class="badge dark">{mode_badge(tape)}</span></p>
+<p>{golden_pill}<span class="badge dark">{mode_badge(tape)}</span></p>
 <p class="muted" data-plays="{s['plays']}" data-downloads="{s['downloads']}" data-likes="{s['likes']}">
 ▶ {s['plays']} plays · ⬇ {s['downloads']} downloads · ♥ {s['likes']} likes</p>
 <p>{html.escape(tape['description'] or '')}</p>
@@ -823,11 +848,12 @@ def artist_page(request: Request, artist_id: int):
     week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
     weekly = chart_rows(conn, since_iso=week_ago, limit=50)
     winner_id = weekly[0][1]["id"] if weekly and weekly[0][0] > 0 else None
+    golden_id = golden_tape_id(conn)
     tapes = conn.execute(
         "SELECT m.*, u.display_name artist_name FROM mixtapes m JOIN users u ON u.id=m.artist_id "
         "WHERE m.artist_id=? AND m.removed=0 ORDER BY m.created_at DESC", (artist_id,)).fetchall()
     followers = conn.execute("SELECT COUNT(*) c FROM follows WHERE artist_id=?", (artist_id,)).fetchone()["c"]
-    cards = "".join(tape_card(conn, dict(t), winner_id) for t in tapes) or "<p class='muted'>No tapes yet.</p>"
+    cards = "".join(tape_card(conn, dict(t), winner_id, golden_id) for t in tapes) or "<p class='muted'>No tapes yet.</p>"
     pro = ' <span class="badge">PRO ✓ VERIFIED</span>' if a["is_pro"] else ""
     body = f"""<h1>{html.escape(a['display_name'])}{pro}</h1>
 <p class="muted">{followers} followers</p>
