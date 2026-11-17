@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DEM HITS acceptance tests — run with the project venv:
+"""HITZ acceptance tests — run with the project venv:
    /tmp/demhits-venv/bin/python tests/run_tests.py
 Uses a temp DATA_DIR/DB and generated WAV audio. Production data untouched.
 """
