@@ -146,6 +146,24 @@ def init_db():
             conn.execute(stmt)
         except sqlite3.OperationalError:
             pass
+    # HITZ RIPS trading cards: artist opt-in flag, pack rip-once stamp, pulls table
+    for stmt in (
+        "ALTER TABLE users ADD COLUMN cards_opt_in INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE transactions ADD COLUMN ripped_at TEXT",
+    ):
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            pass
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS user_cards(
+        id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, artist_id INTEGER NOT NULL,
+        tape_id INTEGER NOT NULL, tier TEXT NOT NULL, value_cents INTEGER NOT NULL DEFAULT 0,
+        txn_id INTEGER NOT NULL, is_sample INTEGER NOT NULL DEFAULT 0,
+        sold_back INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS idx_user_cards_txn ON user_cards(txn_id);
+    CREATE INDEX IF NOT EXISTS idx_user_cards_user ON user_cards(user_id);
+    """)
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_vanity ON users(vanity) "
                  "WHERE vanity IS NOT NULL AND vanity<>''")
     conn.commit()
@@ -507,7 +525,7 @@ def layout(request: Request, title: str, body: str, user=None, og=None) -> HTMLR
 <header class="top">
 <a href="/"><img class="logo" src="/static/hitz-logo.jpg" alt="HITZ — The Real Mixtape Connect"></a>
 <nav class="main">
-<a href="/">Discover</a><a href="/charts">Charts</a><a href="/radio">\U0001F4FB Radio</a><a href="/versus">⚔️ Versus</a><a href="/get-paid">💰 Get Paid</a><a href="/wall-of-paid">Wall of Paid</a><a href="/faq">FAQ</a>
+<a href="/">Discover</a><a href="/charts">Charts</a><a href="/radio">\U0001F4FB Radio</a><a href="/versus">⚔️ Versus</a><a href="/rips">\U0001F0CF Rips</a><a href="/get-paid">💰 Get Paid</a><a href="/wall-of-paid">Wall of Paid</a><a href="/faq">FAQ</a>
 {auth_links}
 </nav></header>
 <div class="wrap">{body}</div>
@@ -745,11 +763,12 @@ def wall_of_paid(request: Request):
     rows = conn.execute(
         "SELECT t.*, a.display_name artist_name, a.vanity artist_vanity, m.title tape_title "
         "FROM transactions t JOIN users a ON a.id=t.artist_id LEFT JOIN mixtapes m ON m.id=t.tape_id "
-        "WHERE t.status='paid' AND t.artist_cents>0 AND t.kind IN ('tip','paid_download','subscription') "
+        "WHERE t.status='paid' AND t.artist_cents>0 AND t.kind IN ('tip','paid_download','subscription','card_pool') "
         "ORDER BY t.fulfilled_at DESC LIMIT 100").fetchall()
     total = sum(r["artist_cents"] for r in rows)
     conn.close()
-    labels = {"tip": "Tip", "paid_download": "Download sale", "subscription": "Fan subscription"}
+    labels = {"tip": "Tip", "paid_download": "Download sale", "subscription": "Fan subscription",
+              "card_pool": "🃏 Trading card pack pool"}
     lines = ""
     for r in rows:
         href = f"/@{r['artist_vanity']}" if r["artist_vanity"] else f"/artist/{r['artist_id']}"
@@ -2260,6 +2279,487 @@ def sponsored_spots():
             "left": max(0, SPONSORED_MAX_ACTIVE - active)}
 
 
+# ---------------------------------------------------------------- HITZ RIPS trading cards
+# Buy a pack -> rip it -> reveal 5 real artist cards. Every card is a real
+# opted-in, charting HITZ artist + their top tape. 40% of every PAID pack is
+# the Artist Pool, split among the pulled artists by card value.
+# Money honesty: packs follow the site-wide rule — a buy saves as an
+# unpaid_request ("payments being connected", no charge) and a pack can only
+# be ripped after its transaction is marked paid by Admin fulfillment
+# (payment verified by Ken), exactly like paid downloads. Free SAMPLE packs
+# carry $0 value, pay no artist pool, and can never be sold back.
+RIPS_PACK_PRICE_CENTS = 1000
+RIPS_PACK_SIZE = 5
+RIPS_POOL_CENTS = 400  # 40% of the $10 pack price
+RIPS_TIER_VALUES = {"Legend": 7500, "Superstar": 2000, "Star": 800, "Rising": 300, "Rookie": 100}
+RIPS_TIER_WEIGHTS = {"Rookie": 55, "Rising": 25, "Star": 12, "Superstar": 6, "Legend": 2}
+RIPS_TIER_ORDER = ["Legend", "Superstar", "Star", "Rising", "Rookie"]
+
+
+def rips_tier_for_rank(rank: int) -> str:
+    if rank <= 1:
+        return "Legend"
+    if rank <= 3:
+        return "Superstar"
+    if rank <= 10:
+        return "Star"
+    if rank <= 25:
+        return "Rising"
+    return "Rookie"
+
+
+def rips_eligible(conn):
+    """Card-eligible artists: opted in AND charting with a real score > 0.
+    Artist score = sum of their tapes' chart scores (plays + 2x downloads +
+    3x likes). The card carries the artist's top-scoring tape."""
+    by_artist = {}
+    for score, tape, stats in chart_rows(conn, limit=100000):
+        a = by_artist.get(tape["artist_id"])
+        if a is None:
+            a = by_artist[tape["artist_id"]] = {
+                "artist_id": tape["artist_id"], "artist_name": tape["artist_name"],
+                "artist_vanity": tape.get("artist_vanity"), "score": 0, "top_score": -1,
+                "tape_id": None, "tape_title": "", "cover_path": None,
+                "stats": {"plays": 0, "downloads": 0, "likes": 0}}
+        a["score"] += score
+        if score > a["top_score"]:
+            a["top_score"] = score
+            a["tape_id"] = tape["id"]
+            a["tape_title"] = tape["title"]
+            a["cover_path"] = tape["cover_path"]
+            a["stats"] = stats
+    out = []
+    for a in by_artist.values():
+        if a["score"] <= 0:
+            continue
+        u = conn.execute("SELECT cards_opt_in FROM users WHERE id=? AND role='artist'",
+                         (a["artist_id"],)).fetchone()
+        if not u or not u["cards_opt_in"]:
+            continue
+        out.append(a)
+    out.sort(key=lambda x: (-x["score"], -x["stats"]["plays"], x["artist_id"]))
+    for i, a in enumerate(out, 1):
+        a["rank"] = i
+        a["tier"] = rips_tier_for_rank(i)
+        a["value_cents"] = RIPS_TIER_VALUES[a["tier"]]
+    return out
+
+
+def rips_tier_pool(eligible):
+    tiers = {}
+    for e in eligible:
+        tiers.setdefault(e["tier"], []).append(e)
+    return tiers
+
+
+def rips_draw(eligible, n=RIPS_PACK_SIZE):
+    """Server-side draw: each card independently picks a tier by the posted
+    weights (redistributed across tiers actually present), then a random
+    artist inside that tier. Duplicates allowed, like real packs."""
+    tiers = rips_tier_pool(eligible)
+    present = [(t, RIPS_TIER_WEIGHTS[t]) for t in RIPS_TIER_ORDER if t in tiers]
+    total = sum(w for _, w in present)
+    picks = []
+    for _ in range(n):
+        r = secrets.randbelow(total)
+        acc = 0
+        chosen = present[-1][0]
+        for t, w in present:
+            acc += w
+            if r < acc:
+                chosen = t
+                break
+        picks.append(secrets.choice(tiers[chosen]))
+    return picks
+
+
+def rips_pool_shares(picks):
+    """Split the Artist Pool by card value. Shares sum EXACTLY to the pool:
+    floor shares first, leftover cents go to the highest-value cards."""
+    total_value = sum(p["value_cents"] for p in picks)
+    shares = [RIPS_POOL_CENTS * p["value_cents"] // total_value for p in picks]
+    rem = RIPS_POOL_CENTS - sum(shares)
+    order = sorted(range(len(picks)), key=lambda i: (-picks[i]["value_cents"], i))
+    k = 0
+    while rem > 0:
+        shares[order[k % len(order)]] += 1
+        rem -= 1
+        k += 1
+    return shares
+
+
+def rips_execute(conn, user, tx):
+    """Rip one pack transaction exactly once. The caller MUST hold a
+    BEGIN IMMEDIATE transaction and commit after. Returns the new card ids,
+    or None if the pack was already ripped or the pool is empty.
+    Paid packs disperse the Artist Pool here — inside the same transaction
+    as the ripped_at stamp, so a re-rip can never double-pay."""
+    fresh = conn.execute("SELECT * FROM transactions WHERE id=?", (tx["id"],)).fetchone()
+    if fresh is None or fresh["ripped_at"]:
+        return None
+    eligible = rips_eligible(conn)
+    if not eligible:
+        return None
+    is_sample = 1 if fresh["kind"] == "card_pack_sample" else 0
+    picks = rips_draw(eligible)
+    card_ids = []
+    for e in picks:
+        cur = conn.execute(
+            "INSERT INTO user_cards(user_id,artist_id,tape_id,tier,value_cents,txn_id,is_sample,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (user["id"], e["artist_id"], e["tape_id"], e["tier"],
+             0 if is_sample else e["value_cents"], fresh["id"], is_sample, now_iso()))
+        card_ids.append(cur.lastrowid)
+    if not is_sample:
+        for e, share in zip(picks, rips_pool_shares(picks)):
+            conn.execute(
+                "INSERT INTO transactions(kind,payer_id,artist_id,tape_id,amount_cents,artist_cents,"
+                "platform_cents,status,meta,created_at,fulfilled_at) "
+                "VALUES('card_pool',?,?,?,?,?,0,'paid',?,?,?)",
+                (user["id"], e["artist_id"], e["tape_id"], share, share,
+                 json.dumps({"pack_txn": fresh["id"], "tier": e["tier"]}), now_iso(), now_iso()))
+    conn.execute("UPDATE transactions SET ripped_at=? WHERE id=?", (now_iso(), fresh["id"]))
+    return card_ids
+
+
+def rips_card_html(card, show_sellback=False):
+    cover = f"/cover/{card['tape_id']}" if card["cover_path"] else "/static/hitz-logo.jpg"
+    sample = ' <span class="badge silver">SAMPLE</span>' if card["is_sample"] else ""
+    sold = ' <span class="badge silver">SOLD BACK</span>' if card["sold_back"] else ""
+    value = "Value $0.00 — SAMPLE" if card["is_sample"] else f"Value {fmt(card['value_cents'])}"
+    sell = ""
+    if show_sellback and not card["is_sample"] and not card["sold_back"]:
+        sell = (f'<form method="post" action="/rips/sellback/{card["id"]}" style="margin-top:8px">'
+                f'<button class="btn secondary small" type="submit">Sell back for {fmt(card["value_cents"])} platform credit</button></form>')
+    if show_sellback and card["is_sample"]:
+        sell = '<p class="muted" style="margin-top:8px">Sample cards have no sell-back value.</p>'
+    return f"""<div class="card">
+<img class="cover" src="{cover}" alt="cover">
+<div style="margin-top:8px"><b style="color:#fff">{html.escape(card['artist_name'])}</b></div>
+<div class="muted">“{html.escape(card['tape_title'])}”</div>
+<div><span class="badge gold">{html.escape(card['tier'].upper())}</span>{sample}{sold}</div>
+<div class="muted" style="margin-top:6px">{value}</div>
+<div class="muted">▶ {card['plays']} plays · ⬇ {card['downloads']} downloads · ♥ {card['likes']} likes</div>
+{sell}</div>"""
+
+
+def rips_cards_for_txn(conn, txn_id):
+    return conn.execute(
+        "SELECT uc.*, m.title tape_title, m.cover_path cover_path, u.display_name artist_name, "
+        "(SELECT COUNT(*) FROM events e WHERE e.tape_id=uc.tape_id AND e.kind='play') plays, "
+        "(SELECT COUNT(*) FROM events e WHERE e.tape_id=uc.tape_id AND e.kind='download') downloads, "
+        "(SELECT COUNT(*) FROM likes l WHERE l.tape_id=uc.tape_id) likes "
+        "FROM user_cards uc JOIN mixtapes m ON m.id=uc.tape_id JOIN users u ON u.id=uc.artist_id "
+        "WHERE uc.txn_id=? ORDER BY uc.id", (txn_id,)).fetchall()
+
+
+@app.get("/rips")
+def rips_page(request: Request):
+    user = current_user(request)
+    conn = get_db()
+    eligible = rips_eligible(conn)
+    tiers = rips_tier_pool(eligible)
+    total_w = sum(RIPS_TIER_WEIGHTS[t] for t in tiers)
+    rank_lines = ""
+    for e in eligible:
+        href = f"/@{e['artist_vanity']}" if e["artist_vanity"] else f"/artist/{e['artist_id']}"
+        rank_lines += (f"<tr><td>#{e['rank']}</td><td><a href='{href}'>{html.escape(e['artist_name'])}</a></td>"
+                       f"<td>{html.escape(e['tape_title'])}</td><td>{e['score']}</td>"
+                       f"<td><span class='badge gold'>{e['tier'].upper()}</span></td><td>{fmt(e['value_cents'])}</td></tr>")
+    rankings = (f"<table><tr><th>#</th><th>Artist</th><th>Top tape</th><th>HITZ Score</th><th>Tier</th><th>Card value</th></tr>{rank_lines}</table>"
+                if eligible else
+                "<div class='card' style='text-align:center;padding:24px'><h3>Series 1 hasn't dropped yet</h3>"
+                "<p class='muted'>The rankings fill up the moment the first artists opt in and chart. "
+                "Artists: turn on “Put me on HITZ Rips trading cards” in your Dashboard, then get plays, downloads and likes.</p></div>")
+    odds_lines = ""
+    for t in RIPS_TIER_ORDER:
+        if t in tiers:
+            pct = RIPS_TIER_WEIGHTS[t] / total_w * 100
+            odds_lines += (f"<tr><td><span class='badge gold'>{t.upper()}</span></td><td>{len(tiers[t])} artist(s)</td>"
+                           f"<td>{fmt(RIPS_TIER_VALUES[t])}</td><td>{pct:.1f}% per card</td></tr>")
+    odds = (f"<table><tr><th>Tier</th><th>In the pool</th><th>Card value</th><th>Odds</th></tr>{odds_lines}</table>"
+            "<p class='muted'>Odds are computed live from the artists actually in the pool right now, using the posted tier weights "
+            "(Rookie 55 · Rising 25 · Star 12 · Superstar 6 · Legend 2, redistributed across the tiers present). "
+            "Each of the 5 cards in a pack is drawn independently — duplicates can happen, like real packs.</p>"
+            if eligible else "<p class='muted'>Pack odds appear here as soon as the first artists are in the pool.</p>")
+    my_packs = ""
+    sample_html = ""
+    if user:
+        packs = conn.execute(
+            "SELECT * FROM transactions WHERE payer_id=? AND kind='card_pack' ORDER BY created_at DESC LIMIT 10",
+            (user["id"],)).fetchall()
+        lines = ""
+        for p in packs:
+            if p["ripped_at"]:
+                action = f"<a class='btn small secondary' href='/rips/reveal/{p['id']}'>View your rip</a>"
+                state = "Ripped"
+            elif p["status"] == "paid":
+                action = (f"<form method='post' action='/rips/rip/{p['id']}' style='display:inline'>"
+                          "<button class='btn small' type='submit'>\U0001F0CF RIP IT NOW</button></form>")
+                state = "Paid — ready to rip"
+            else:
+                action = "<span class='muted'>Unlocks when payment is verified</span>"
+                state = "Saved — payments being connected, no charge made yet"
+            lines += (f"<div class='card' style='margin:8px 0'><b>Series 1 Pack</b> · {fmt(p['amount_cents'])} · {state} "
+                      f"<span class='muted'>{p['created_at'][:10]}</span><div style='margin-top:6px'>{action}</div></div>")
+        if lines:
+            my_packs = f"<h2>Your packs</h2>{lines}"
+        has_sample = conn.execute(
+            "SELECT 1 FROM transactions WHERE payer_id=? AND kind='card_pack_sample'",
+            (user["id"],)).fetchone()
+        if not has_sample:
+            sample_html = (f"<form method='post' action='/rips/sample' style='margin-top:10px'>"
+                           "<button class='btn secondary' type='submit'>Rip ONE free SAMPLE pack</button></form>"
+                           "<p class='muted'>Every account gets one free sample rip. Sample cards are marked SAMPLE, "
+                           "worth $0, pay no artist pool and can't be sold back.</p>") if eligible else \
+                          "<p class='muted'>Free sample packs open when Series 1 drops.</p>"
+        else:
+            sample_html = "<p class='muted'>You've ripped your free sample pack.</p>"
+    else:
+        sample_html = "<p class='muted'><a href='/login'>Log in</a> to buy a pack or rip your one free sample pack.</p>"
+    buy_html = (f"<form method='post' action='/rips/buy'>"
+                "<button class='btn' type='submit'>Buy a Series 1 Pack — $10.00</button></form>"
+                f"<p class='muted'>{money_label()}.</p>") if eligible else \
+               "<p><b>Packs aren't on sale yet</b> — Series 1 drops when the first artists opt in and chart.</p>"
+    body = f"""<h1>\U0001F0CF HITZ RIPS — Trading Cards</h1>
+<p>Rip. Reveal. Triumph — HITZ style. Buy a pack, rip it open and pull <b>real HITZ artists</b> as trading cards:
+the artist + their top tape's cover, ranked by real plays, downloads and likes. <b>Every artist whose card you pull
+gets paid</b> out of the pack you bought.</p>
+<h2>\U0001F4CA Artist Power Rankings</h2>
+<p class="muted">Ranked by HITZ Score (plays + 2× downloads + 3× likes, all tapes combined). Only artists who opted in
+and are charting get a card. Tiers by rank: #1 Legend {fmt(7500)} · #2–3 Superstar {fmt(2000)} · #4–10 Star {fmt(800)} ·
+#11–25 Rising {fmt(300)} · #26+ Rookie {fmt(100)}.</p>
+{rankings}
+<h2>\U0001F4E6 Series 1 Pack — $10 · 5 cards</h2>
+{odds}
+<div class="card"><h3>Where the $10 goes</h3>
+<p><b>40% Artist Pool</b> — split among the artists whose cards you pull, weighted by card value<br>
+<b>30% HITZ</b> — runs the platform<br>
+<b>20% Printing + shipping fund</b> — for physical cards<br>
+<b>10% Chase fund</b> — backs the big rare pulls</p>
+{buy_html}
+{sample_html}
+<p style="margin-top:10px"><a href="/rips/my">Your card collection →</a></p></div>
+{my_packs}
+<h2>How it works</h2>
+<div class="card"><p><b>1. Buy a pack</b> — while payments are being connected your request is saved and no charge is made;
+the pack unlocks the moment payment is verified.</p>
+<p><b>2. Rip it</b> — 5 cards are drawn server-side at the live posted odds.</p>
+<p><b>3. Reveal + collect</b> — cards land in <a href="/rips/my">your collection</a> with the artist, cover, tier, value and tape stats.</p>
+<p><b>4. Artists eat</b> — the $4.00 Artist Pool from your pack is split among the 5 pulled artists by card value,
+and shows up in their HITZ earnings like tips and sales.</p>
+<p><b>5. Sell back or hold</b> — sell any paid card back for its full value in <b>platform credit</b> (not cash),
+or hold it in your collection. Physical shipping comes later, backed by the printing + shipping fund.</p>
+<p class="muted">Artists: opt in from your <a href="/dashboard">Dashboard</a> — “Put me on HITZ Rips trading cards.”</p></div>"""
+    conn.close()
+    return layout(request, "HITZ Rips", body, user)
+
+
+@app.post("/rips/opt-in")
+def rips_opt_in(request: Request, opt_in: str = Form("0")):
+    user, redir = require_login(request)
+    if redir:
+        return redir
+    if user["role"] != "artist":
+        return PlainTextResponse("Trading cards are for Artist accounts.", status_code=403)
+    conn = get_db()
+    conn.execute("UPDATE users SET cards_opt_in=? WHERE id=?",
+                 (1 if opt_in == "1" else 0, user["id"]))
+    conn.commit()
+    conn.close()
+    return RedirectResponse("/dashboard", status_code=303)
+
+
+@app.post("/rips/buy")
+def rips_buy(request: Request):
+    user, redir = require_login(request)
+    if redir:
+        return redir
+    conn = get_db()
+    if not rips_eligible(conn):
+        conn.close()
+        return PlainTextResponse(
+            "Series 1 packs aren't on sale yet — no artists are in the card pool. "
+            "Packs drop when the first artists opt in and chart.", status_code=400)
+    create_tx(conn, "card_pack", user["id"], None, None, RIPS_PACK_PRICE_CENTS, 0, meta="series1_pack")
+    conn.commit()
+    conn.close()
+    return RedirectResponse("/rips", status_code=303)
+
+
+@app.post("/rips/sample")
+def rips_sample(request: Request):
+    user, redir = require_login(request)
+    if redir:
+        return redir
+    conn = get_db()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = conn.execute(
+            "SELECT id FROM transactions WHERE payer_id=? AND kind='card_pack_sample'",
+            (user["id"],)).fetchone()
+        if existing:
+            conn.rollback()
+            conn.close()
+            return PlainTextResponse("You've already ripped your one free sample pack.", status_code=400)
+        cur = conn.execute(
+            "INSERT INTO transactions(kind,payer_id,artist_id,tape_id,amount_cents,artist_cents,"
+            "platform_cents,status,meta,created_at,fulfilled_at) "
+            "VALUES('card_pack_sample',?,NULL,NULL,0,0,0,'paid','free_sample_pack',?,?)",
+            (user["id"], now_iso(), now_iso()))
+        tx = conn.execute("SELECT * FROM transactions WHERE id=?", (cur.lastrowid,)).fetchone()
+        card_ids = rips_execute(conn, user, tx)
+        if not card_ids:
+            conn.rollback()
+            conn.close()
+            return PlainTextResponse(
+                "Sample packs open when Series 1 drops — no artists are in the card pool yet.", status_code=400)
+        conn.commit()
+        tx_id = tx["id"]
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
+    return RedirectResponse(f"/rips/reveal/{tx_id}", status_code=303)
+
+
+@app.post("/rips/rip/{tx_id}")
+def rips_rip(request: Request, tx_id: int):
+    user, redir = require_login(request)
+    if redir:
+        return redir
+    conn = get_db()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        tx = conn.execute("SELECT * FROM transactions WHERE id=?", (tx_id,)).fetchone()
+        if not tx or tx["kind"] != "card_pack":
+            conn.rollback()
+            conn.close()
+            return PlainTextResponse("Pack not found.", status_code=404)
+        if tx["payer_id"] != user["id"]:
+            conn.rollback()
+            conn.close()
+            return PlainTextResponse("That pack isn't yours.", status_code=403)
+        if tx["ripped_at"]:
+            conn.rollback()
+            conn.close()
+            return RedirectResponse(f"/rips/reveal/{tx_id}", status_code=303)
+        if tx["status"] != "paid":
+            conn.rollback()
+            conn.close()
+            return PlainTextResponse(
+                "This pack isn't unlocked yet — payment hasn't been verified. "
+                "While payments are being connected, requests are saved and no charge is made.", status_code=400)
+        card_ids = rips_execute(conn, user, tx)
+        if not card_ids:
+            conn.rollback()
+            conn.close()
+            return PlainTextResponse(
+                "This pack can't be ripped right now — the card pool is empty.", status_code=400)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
+    return RedirectResponse(f"/rips/reveal/{tx_id}", status_code=303)
+
+
+@app.get("/rips/reveal/{tx_id}")
+def rips_reveal(request: Request, tx_id: int):
+    user, redir = require_login(request)
+    if redir:
+        return redir
+    conn = get_db()
+    tx = conn.execute("SELECT * FROM transactions WHERE id=?", (tx_id,)).fetchone()
+    if not tx or tx["kind"] not in ("card_pack", "card_pack_sample") or tx["payer_id"] != user["id"]:
+        conn.close()
+        return PlainTextResponse("Pack not found.", status_code=404)
+    cards = rips_cards_for_txn(conn, tx_id)
+    conn.close()
+    if not cards:
+        return RedirectResponse("/rips", status_code=303)
+    grid = "".join(rips_card_html(c) for c in cards)
+    sample_note = ("<div class='ok'>This was your <b>free SAMPLE pack</b> — cards are marked SAMPLE, worth $0, "
+                   "no artist pool was paid and sample cards can't be sold back.</div>"
+                   if tx["kind"] == "card_pack_sample" else
+                   "<div class='ok'>The $4.00 Artist Pool from this pack was split among these artists by card value — "
+                   "it lands in their HITZ earnings.</div>")
+    body = f"""<h1>\U0001F0CF Your rip</h1>
+{sample_note}
+<div class="grid">{grid}</div>
+<p style="margin-top:14px"><a class="btn secondary" href="/rips/my">See your collection</a>
+<a class="btn secondary" href="/rips">Back to Rips</a></p>"""
+    return layout(request, "Your rip", body, user)
+
+
+@app.get("/rips/my")
+def rips_my(request: Request):
+    user, redir = require_login(request)
+    if redir:
+        return redir
+    conn = get_db()
+    cards = conn.execute(
+        "SELECT uc.*, m.title tape_title, m.cover_path cover_path, u.display_name artist_name, "
+        "(SELECT COUNT(*) FROM events e WHERE e.tape_id=uc.tape_id AND e.kind='play') plays, "
+        "(SELECT COUNT(*) FROM events e WHERE e.tape_id=uc.tape_id AND e.kind='download') downloads, "
+        "(SELECT COUNT(*) FROM likes l WHERE l.tape_id=uc.tape_id) likes "
+        "FROM user_cards uc JOIN mixtapes m ON m.id=uc.tape_id JOIN users u ON u.id=uc.artist_id "
+        "WHERE uc.user_id=? ORDER BY uc.created_at DESC, uc.id DESC", (user["id"],)).fetchall()
+    total_value = sum(c["value_cents"] for c in cards if not c["is_sample"] and not c["sold_back"])
+    credit = conn.execute(
+        "SELECT COALESCE(SUM(amount_cents),0) s FROM transactions WHERE payer_id=? AND kind='card_sellback_credit'",
+        (user["id"],)).fetchone()["s"]
+    conn.close()
+    grid = "".join(rips_card_html(c, show_sellback=True) for c in cards)
+    body = f"""<h1>\U0001F0CF Your card collection</h1>
+<div class="grid">
+<div class="card"><h3>Collection value</h3><p style="font-size:1.5rem">{fmt(total_value)}</p>
+<p class="muted">Face value of your unsold paid cards. Sample cards are worth $0.</p></div>
+<div class="card"><h3>Platform credit</h3><p style="font-size:1.5rem">{fmt(credit)}</p>
+<p class="muted">Credit earned from sell-backs. Platform credit is not cash.</p></div>
+<div class="card"><h3>Cards</h3><p style="font-size:1.5rem">{len(cards)}</p>
+<p class="muted"><a href="/rips">Rip more packs →</a></p></div>
+</div>
+<div class="grid" style="margin-top:14px">{grid or '<div class="card" style="text-align:center;padding:24px"><h3>No cards yet</h3><p class="muted">Rip a pack and your cards land here.</p><a class="btn" href="/rips">Go to Rips</a></div>'}</div>"""
+    return layout(request, "Your cards", body, user)
+
+
+@app.post("/rips/sellback/{card_id}")
+def rips_sellback(request: Request, card_id: int):
+    user, redir = require_login(request)
+    if redir:
+        return redir
+    conn = get_db()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        card = conn.execute("SELECT * FROM user_cards WHERE id=?", (card_id,)).fetchone()
+        if not card or card["user_id"] != user["id"]:
+            conn.rollback()
+            conn.close()
+            return PlainTextResponse("Card not found.", status_code=404)
+        if card["is_sample"] or card["value_cents"] <= 0:
+            conn.rollback()
+            conn.close()
+            return PlainTextResponse("Sample cards have no sell-back value.", status_code=400)
+        if card["sold_back"]:
+            conn.rollback()
+            conn.close()
+            return PlainTextResponse("That card was already sold back.", status_code=400)
+        conn.execute("UPDATE user_cards SET sold_back=1 WHERE id=?", (card_id,))
+        conn.execute(
+            "INSERT INTO transactions(kind,payer_id,artist_id,tape_id,amount_cents,artist_cents,"
+            "platform_cents,status,meta,created_at) "
+            "VALUES('card_sellback_credit',?,NULL,?,?,0,0,'credit',?,?)",
+            (user["id"], card["tape_id"], card["value_cents"],
+             json.dumps({"card_id": card_id, "credit": "platform_credit_not_cash"}), now_iso()))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
+    return RedirectResponse("/rips/my", status_code=303)
+
+
 # ---------------------------------------------------------------- artist dashboard
 @app.get("/dashboard")
 def dashboard(request: Request):
@@ -2267,7 +2767,7 @@ def dashboard(request: Request):
     if redir:
         return redir
     conn = get_db()
-    earn_kinds = ("tip", "paid_download", "subscription")
+    earn_kinds = ("tip", "paid_download", "subscription", "card_pool")
     paid_rows = conn.execute(
         f"SELECT kind, SUM(artist_cents) s, COUNT(*) n FROM transactions WHERE artist_id=? AND status='paid' AND kind IN {earn_kinds} GROUP BY kind",
         (user["id"],)).fetchall()
@@ -2282,6 +2782,7 @@ def dashboard(request: Request):
     followers = 0
     pro_nudge = ""
     tapes_html = ""
+    rips_html = ""
     if user["role"] == "artist":
         followers = conn.execute("SELECT COUNT(*) c FROM follows WHERE artist_id=?", (user["id"],)).fetchone()["c"]
         sales = conn.execute(
@@ -2317,6 +2818,15 @@ def dashboard(request: Request):
 <option value="7">$99 — 7 days</option><option value="14">$199 — 14 days</option></select></label>
 <button class="btn secondary small" type="submit">Request Sponsored spot</button></form></div>"""
         tapes_html = f"<h2>Your tapes</h2>{lines or '<p class=\"muted\">No tapes yet.</p>'}"
+        opted = bool(user.get("cards_opt_in"))
+        rips_html = f"""<h2>\U0001F0CF HITZ Rips trading cards</h2>
+<div class="card"><form method="post" action="/rips/opt-in">
+<label>Put me on HITZ Rips trading cards <select name="opt_in">
+<option value="0" {'selected' if not opted else ''}>No — keep me off the cards</option>
+<option value="1" {'selected' if opted else ''}>YES — put me on the cards</option></select></label>
+<p class="muted">Opted-in artists who are charting get a trading card (you + your top tape's cover). When a fan pulls your card from a paid pack, you earn from the Artist Pool — 40% of every pack, split by card value. Card pool earnings land in your Earnings above like tips and sales.</p>
+<button class="btn small" type="submit">Save card setting</button></form>
+<p style="margin-top:8px"><a href="/rips">See the Artist Power Rankings →</a></p></div>"""
     req_lines = "".join(
         f"<tr><td>{html.escape(r['kind'])}</td><td>{fmt(r['amount_cents'])}</td>"
         f"<td>{html.escape(r['status'])}</td><td>{html.escape(r['created_at'][:10])}</td></tr>"
@@ -2345,6 +2855,7 @@ def dashboard(request: Request):
 </div>
 <h2>Your requests</h2>
 <table><tr><th>Type</th><th>Amount</th><th>Status</th><th>Date</th></tr>{req_lines or '<tr><td colspan="4" class="muted">None yet</td></tr>'}</table>
+{rips_html}
 {tapes_html}"""
     conn.close()
     return layout(request, "Dashboard", body, user)
