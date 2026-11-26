@@ -442,6 +442,8 @@ table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid #333;pad
 .trackline{display:flex;align-items:center;gap:10px;padding:8px;border-bottom:1px solid #262626}
 details{background:#111;border:1px solid #333;border-radius:10px;padding:10px 14px;margin:9px 0}
 summary{cursor:pointer;font-weight:700;color:#e8c15a}
+.xpromo{max-width:1060px;margin:26px auto 0;padding:14px;text-align:center;font-size:.82rem;color:#777;border-top:1px solid #1c1c1c}
+.xpromo a{color:#a8893a;font-weight:600}.xpromo a:hover{color:#e8c15a}
 """
 
 PLAYER_JS = """
@@ -529,6 +531,7 @@ def layout(request: Request, title: str, body: str, user=None, og=None) -> HTMLR
 {auth_links}
 </nav></header>
 <div class="wrap">{body}</div>
+<footer class="xpromo">from the same house &middot; the people, posts &amp; live are over on <a href="https://joincomehere.com" target="_blank" rel="noopener">HERE &rarr;</a></footer>
 <div id="player"><div class="row">
 <button id="p-btn" onclick="dhToggle()" aria-label="Play or pause">▶</button>
 <button onclick="dhStep(-1)" aria-label="Previous track" style="font-size:.8rem">⏮</button>
