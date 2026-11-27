@@ -409,4 +409,50 @@ late_id = int(r.headers["location"].rstrip("/").split("/")[-1])
 r = artist2.post("/verse-entry", data={"original_id": tape2, "entry_id": late_id}, follow_redirects=False)
 check("closed verse takes no entries", r.status_code == 400, str(r.status_code))
 
+# ------------------------------------------------ singles (Wave 3)
+def upload_kind(client, title, kind, tracks):
+    files = [("cover", ("cover.png", PNG_COVER, "image/png"))]
+    for t in tracks:
+        files.append(("tracks", t))
+    data = {"title": title, "genre": "Hip-Hop", "description": "test",
+            "download_mode": "free", "price": "10", "rights": "yes", "kind": kind}
+    return client.post("/upload", data=data, files=files, follow_redirects=False)
+
+
+r = artist.get("/upload")
+check("upload page offers the single option", "SINGLE — just one song" in r.text)
+
+r = upload_kind(artist, "Lone Single", "single", [("one.wav", WAV1, "audio/wav")])
+check("single upload accepted", r.status_code == 303, str(r.status_code))
+single_id = int(r.headers["location"].rstrip("/").split("/")[-1])
+conn = db()
+kind_row = conn.execute("SELECT kind FROM mixtapes WHERE id=?", (single_id,)).fetchone()
+conn.close()
+check("single stored as kind=single", kind_row[0] == "single", str(kind_row))
+
+r = upload_kind(artist, "Fake Single", "single", [("a.wav", WAV1, "audio/wav"), ("b.wav", WAV2, "audio/wav")])
+check("single with two tracks rejected 400", r.status_code == 400, str(r.status_code))
+
+r = fan.get(f"/tape/{single_id}")
+check("single page wears the SINGLE pill", "SINGLE" in r.text)
+
+r = anon.get("/singles")
+check("singles page lists the single", r.status_code == 200 and "Lone Single" in r.text and "SINGLE" in r.text)
+check("singles page keeps mixtapes out", "First Tape" not in r.text)
+
+r = anon.get("/")
+check("homepage has a Fresh Singles section", "Fresh Singles" in r.text and "Lone Single" in r.text)
+
+r = anon.get("/charts")
+check("charts have a Top Singles board", "Top Singles" in r.text)
+
+r = fan.post(f"/play/{single_id}")
+check("single play counts", r.status_code == 200 and r.json()["counted"] is True)
+r = anon.get("/singles")
+check("most-played single wears GOLDEN SINGLE", "GOLDEN SINGLE" in r.text)
+r = fan.get(f"/tape/{single_id}")
+check("golden single pill on its own page", "GOLDEN SINGLE" in r.text)
+r = fan.get(f"/tape/{tape1}")
+check("golden single does not leak onto a tape page", "GOLDEN SINGLE" not in r.text)
+
 print(f"\nALL {len(PASS)} CHECKS PASSED")
