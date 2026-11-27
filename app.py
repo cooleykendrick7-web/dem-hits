@@ -141,6 +141,7 @@ def init_db():
     for stmt in (
         "ALTER TABLE mixtapes ADD COLUMN open_verse INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE mixtapes ADD COLUMN open_verse_note TEXT DEFAULT ''",
+        "ALTER TABLE mixtapes ADD COLUMN kind TEXT NOT NULL DEFAULT 'tape'",
     ):
         try:
             conn.execute(stmt)
@@ -260,11 +261,13 @@ def tape_stats(conn, tape_id: int):
     return {"plays": plays, "downloads": downloads, "likes": likes}
 
 
-def chart_rows(conn, since_iso=None, limit=50):
+def chart_rows(conn, since_iso=None, limit=50, kind=None):
     rows = conn.execute(
         "SELECT m.*, u.display_name artist_name, u.vanity artist_vanity, u.city artist_city FROM mixtapes m JOIN users u ON u.id=m.artist_id "
         "WHERE m.removed=0 AND (m.release_at IS NULL OR m.release_at<=?) ORDER BY m.created_at DESC",
         (now_iso(),)).fetchall()
+    if kind:
+        rows = [r for r in rows if (r["kind"] if "kind" in r.keys() else "tape") == kind]
     out = []
     for r in rows:
         if since_iso:
@@ -286,7 +289,14 @@ def chart_rows(conn, since_iso=None, limit=50):
 def golden_tape_id(conn):
     """The GOLDEN TAPE: the all-time #1 tape by chart score
     (plays + 2x downloads + 3x likes), only once it has real activity."""
-    rows = chart_rows(conn, limit=1)
+    rows = chart_rows(conn, limit=1, kind="tape")
+    return rows[0][1]["id"] if rows and rows[0][0] > 0 else None
+
+
+def golden_single_id(conn):
+    """The GOLDEN SINGLE: the all-time #1 single by the same chart score,
+    only once it has real activity."""
+    rows = chart_rows(conn, limit=1, kind="single")
     return rows[0][1]["id"] if rows and rows[0][0] > 0 else None
 
 
@@ -527,7 +537,7 @@ def layout(request: Request, title: str, body: str, user=None, og=None) -> HTMLR
 <header class="top">
 <a href="/"><img class="logo" src="/static/hitz-logo.jpg" alt="HITZ — The Real Mixtape Connect"></a>
 <nav class="main">
-<a href="/">Discover</a><a href="/charts">Charts</a><a href="/radio">\U0001F4FB Radio</a><a href="/versus">⚔️ Versus</a><a href="/rips">\U0001F0CF Rips</a><a href="/get-paid">💰 Get Paid</a><a href="/wall-of-paid">Wall of Paid</a><a href="/faq">FAQ</a>
+<a href="/">Discover</a><a href="/singles">\U0001F3B5 Singles</a><a href="/charts">Charts</a><a href="/radio">\U0001F4FB Radio</a><a href="/versus">⚔️ Versus</a><a href="/rips">\U0001F0CF Rips</a><a href="/get-paid">💰 Get Paid</a><a href="/wall-of-paid">Wall of Paid</a><a href="/faq">FAQ</a>
 {auth_links}
 </nav></header>
 <div class="wrap">{body}</div>
@@ -547,7 +557,7 @@ def layout(request: Request, title: str, body: str, user=None, og=None) -> HTMLR
     return HTMLResponse(page)
 
 
-def tape_card(conn, tape, winner_id=None, golden_id=None) -> str:
+def tape_card(conn, tape, winner_id=None, golden_id=None, gsingle_id=None) -> str:
     s = tape_stats(conn, tape["id"])
     cover = f"/cover/{tape['id']}" if tape["cover_path"] else "/static/hitz-logo.jpg"
     winner = '<span class="badge">🏆 CHART WINNER</span>' if winner_id == tape["id"] else ""
@@ -565,14 +575,20 @@ def tape_card(conn, tape, winner_id=None, golden_id=None) -> str:
                   if tape["genre"] else "")
     stats_line = (f"\u25B6 {s['plays']} plays \u00B7 \u2B07 {s['downloads']} downloads \u00B7 \u2665 {s['likes']} likes"
                   if live else f"\U0001F525 Premiere \u2014 drops {tape['release_at'][:10]}. Be here when it lands.")
+    is_single = tape.get("kind") == "single"
+    singlepill = '<span class="badge gold">\U0001F3B5 SINGLE</span>' if is_single else ""
     golden = ('<img class="goldentape" src="/static/golden-tape.jpg" alt="GOLDEN TAPE" '
               'title="GOLDEN TAPE - the most-played tape on HITZ">') if golden_id == tape["id"] else ""
     goldpill = '<span class="badge gold">\U0001F947 GOLDEN TAPE</span>' if golden_id == tape["id"] else ""
+    if is_single and gsingle_id == tape["id"]:
+        golden = ('<img class="goldentape" src="/static/golden-tape.jpg" alt="GOLDEN SINGLE" '
+                  'title="GOLDEN SINGLE - the most-played single on HITZ">')
+        goldpill = '<span class="badge gold">\U0001F947 GOLDEN SINGLE</span>'
     return f"""<div class="card">
 <div class="coverwrap"><a href="/tape/{tape['id']}"><img class="cover" src="{cover}" alt="cover"></a>{golden}</div>
 <div style="margin-top:8px"><a href="/tape/{tape['id']}" style="font-weight:800;color:#fff">{html.escape(tape['title'])}</a></div>
 <div class="muted">by <a href="{artist_href}">{html.escape(tape['artist_name'])}</a> · {genre_html}</div>
-<div><span class="badge dark">{mode_badge(tape)}</span>{winner}{goldpill}{vspill}{ovpill}{prem}{hosted}{sp}</div>
+<div><span class="badge dark">{mode_badge(tape)}</span>{singlepill}{winner}{goldpill}{vspill}{ovpill}{prem}{hosted}{sp}</div>
 <div class="muted" style="margin-top:6px" data-plays="{s['plays']}" data-downloads="{s['downloads']}" data-likes="{s['likes']}">
 ▶ {s['plays']} plays · ⬇ {s['downloads']} downloads · ♥ {s['likes']} likes</div>
 <button class="btn small" style="margin-top:8px" onclick="dhShare('{html.escape(tape['artist_name'], quote=True)}','{html.escape(tape['title'], quote=True)}')">Share</button>
@@ -612,25 +628,32 @@ def home(request: Request):
     user = current_user(request)
     latest = conn.execute(
         "SELECT m.*, u.display_name artist_name, u.vanity artist_vanity, u.city artist_city FROM mixtapes m JOIN users u ON u.id=m.artist_id "
-        "WHERE m.removed=0 ORDER BY m.created_at DESC LIMIT 12").fetchall()
+        "WHERE m.removed=0 AND m.kind='tape' ORDER BY m.created_at DESC LIMIT 12").fetchall()
+    singles_latest = conn.execute(
+        "SELECT m.*, u.display_name artist_name, u.vanity artist_vanity, u.city artist_city FROM mixtapes m JOIN users u ON u.id=m.artist_id "
+        "WHERE m.removed=0 AND m.kind='single' ORDER BY m.created_at DESC LIMIT 6").fetchall()
     trending = chart_rows(conn, limit=6)
     week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
     weekly = chart_rows(conn, since_iso=week_ago, limit=1)
     winner_id = weekly[0][1]["id"] if weekly and weekly[0][0] > 0 else None
     golden_id = golden_tape_id(conn)
+    gsingle_id = golden_single_id(conn)
     sponsored = sponsored_active(conn)
     sp_ids = [r["tape_id"] for r in sponsored]
-    cards = "".join(tape_card(conn, dict(t), winner_id, golden_id) for t in latest)
-    trend_cards = "".join(tape_card(conn, t, winner_id, golden_id) for _, t, _ in trending if t["id"] not in [x["id"] for x in latest])
+    cards = "".join(tape_card(conn, dict(t), winner_id, golden_id, gsingle_id) for t in latest)
+    single_cards = "".join(tape_card(conn, dict(t), winner_id, golden_id, gsingle_id) for t in singles_latest)
+    singles_section = (f"<h2 style='margin-top:28px'>\U0001F3B5 Fresh Singles</h2><div class='grid'>{single_cards}</div>"
+                       f"<p><a class='chip' href='/singles'>All singles \u2192</a></p>") if singles_latest else ""
+    trend_cards = "".join(tape_card(conn, t, winner_id, golden_id, gsingle_id) for _, t, _ in trending if t["id"] not in [x["id"] for x in latest])
     sp_cards = ""
     if sp_ids:
         rows = conn.execute(
             "SELECT m.*, u.display_name artist_name, u.vanity artist_vanity, u.city artist_city FROM mixtapes m JOIN users u ON u.id=m.artist_id "
             f"WHERE m.id IN ({','.join('?' * len(sp_ids))})", sp_ids).fetchall()
         sp_cards = ("<h2>Sponsored</h2><div class='grid'>" +
-                    "".join(tape_card(conn, dict(r), winner_id, golden_id) for r in rows) + "</div>")
+                    "".join(tape_card(conn, dict(r), winner_id, golden_id, gsingle_id) for r in rows) + "</div>")
     conn.close()
-    if not latest:
+    if not latest and not singles_latest:
         empty = """<div class="card" style="text-align:center;padding:28px">
 <h3>Be The First</h3><p class="muted">No tapes yet. The first artist to drop sets the tone.</p>
 <a class="btn" href="/signup">Create a free Artist account</a></div>"""
@@ -639,12 +662,13 @@ def home(request: Request):
 <div class="hero"><img src="/static/hitz-logo.jpg" alt="HITZ logo">
 <h1>HITZ — <span class="silver">THE REAL MIXTAPE CONNECT</span></h1>
 <div class="bigfree">FREE TO UPLOAD</div>
-<p style="font-size:1.1rem">Artists post mixtapes free, fans stream free — and artists actually <b class="gold">get paid</b>:
+<p style="font-size:1.1rem">Artists post mixtapes and singles free, fans stream free — and artists actually <b class="gold">get paid</b>:
 80% of sales, 90% of tips, 80% of fan subs.</p>
 <p><a class="btn" href="/radio">\U0001F4FB Play HITZ Radio</a> <a class="btn secondary" href="/get-paid">💰 See how you get paid</a> <a class="btn secondary" href="/signup">Create Free Artist Account</a></p>
 </div>
 {sp_cards}
 <h2>Latest Drops</h2><div class="grid">{cards}</div>
+{singles_section}
 <h2 style="margin-top:28px">Trending</h2><div class="grid">{trend_cards or '<p class="muted">Nothing trending yet.</p>'}</div>
 <h2 style="margin-top:28px">Browse</h2><p><a class="chip" href="/genres">\U0001F3B6 Genres</a><a class="chip" href="/cities">\U0001F4CD Cities</a><a class="chip" href="/versus">\u2694\uFE0F Versus Battles</a><a class="chip" href="/wall-of-paid">\U0001F4B0 Wall of Paid</a></p>
 {SHARE_JS}"""
@@ -657,11 +681,12 @@ def charts(request: Request):
     week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
     weekly = chart_rows(conn, since_iso=week_ago, limit=20)
     alltime = chart_rows(conn, limit=20)
+    top_singles = chart_rows(conn, limit=20, kind="single")
     winner_id = weekly[0][1]["id"] if weekly and weekly[0][0] > 0 else None
 
     golden_id = golden_tape_id(conn)
 
-    def rows(data, mark_golden=False):
+    def rows(data, mark_golden=False, noun="Tape"):
         if not data or all(s == 0 for s, _, _ in data):
             return "<p class='muted'>No chart activity yet — be the first.</p>"
         trs = ""
@@ -672,12 +697,44 @@ def charts(request: Request):
                     f"{' 🏆' if t['id'] == winner_id else ''}</td>"
                     f"<td><a href='/artist/{t['artist_id']}'>{html.escape(t['artist_name'])}</a></td>"
                     f"<td>{mode_badge(t)}</td><td>{s['plays']}</td><td>{s['downloads']}</td><td>{s['likes']}</td></tr>")
-        return ("<table><tr><th>#</th><th>Tape</th><th>Artist</th><th>Mode</th>"
+        return (f"<table><tr><th>#</th><th>{noun}</th><th>Artist</th><th>Mode</th>"
                 "<th>Plays</th><th>Downloads</th><th>Likes</th></tr>" + trs + "</table>")
 
-    body = f"<h1>Charts</h1><h2>Top This Week</h2>{rows(weekly)}<h2 style='margin-top:30px'>Top All-Time</h2>{rows(alltime, mark_golden=True)}{SHARE_JS}"
+    body = f"<h1>Charts</h1><h2>Top This Week</h2>{rows(weekly)}<h2 style='margin-top:30px'>Top All-Time</h2>{rows(alltime, mark_golden=True)}<h2 style='margin-top:30px'>\U0001F3B5 Top Singles</h2>{rows(top_singles, noun='Single')}{SHARE_JS}"
     conn.close()
     return layout(request, "Charts", body)
+
+
+@app.get("/singles")
+def singles_page(request: Request):
+    conn = get_db()
+    user = current_user(request)
+    latest = conn.execute(
+        "SELECT m.*, u.display_name artist_name, u.vanity artist_vanity, u.city artist_city FROM mixtapes m JOIN users u ON u.id=m.artist_id "
+        "WHERE m.removed=0 AND m.kind='single' ORDER BY m.created_at DESC LIMIT 24").fetchall()
+    top = chart_rows(conn, limit=6, kind="single")
+    week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    weekly = chart_rows(conn, since_iso=week_ago, limit=1)
+    winner_id = weekly[0][1]["id"] if weekly and weekly[0][0] > 0 else None
+    golden_id = golden_tape_id(conn)
+    gsingle_id = golden_single_id(conn)
+    latest_ids = [t["id"] for t in latest]
+    cards = "".join(tape_card(conn, dict(t), winner_id, golden_id, gsingle_id) for t in latest)
+    top_cards = "".join(tape_card(conn, t, winner_id, golden_id, gsingle_id) for _, t, _ in top if t["id"] not in latest_ids)
+    conn.close()
+    if not latest:
+        body = """<h1>\U0001F3B5 Singles</h1>
+<div class="card" style="text-align:center;padding:28px">
+<h3>Be The First</h3><p class="muted">No singles yet. Got one song ready? Drop it — no mixtape needed.</p>
+<a class="btn" href="/signup">Create a free Artist account</a></div>""" + SHARE_JS
+        return layout(request, "Singles", body, user)
+    top_section = f"<h2 style='margin-top:28px'>Top Singles</h2><div class='grid'>{top_cards}</div>" if top_cards else ""
+    body = f"""<h1>\U0001F3B5 Singles</h1>
+<p class="muted">One song, all yours. Singles stream free, chart on their own board, and earn the same way tapes do — downloads, tips and subs.</p>
+<h2>Fresh Singles</h2><div class="grid">{cards}</div>
+{top_section}
+{SHARE_JS}"""
+    return layout(request, "Singles", body, user)
 
 
 @app.get("/get-paid")
@@ -918,7 +975,7 @@ def sitemap(request: Request):
     genres = {slugify(r["genre"]) for r in conn.execute("SELECT DISTINCT genre FROM mixtapes WHERE removed=0 AND genre<>''").fetchall()}
     cities = {slugify(r["city"]) for r in conn.execute("SELECT DISTINCT city FROM users WHERE role='artist' AND city<>''").fetchall()}
     conn.close()
-    urls = ["/", "/charts", "/get-paid", "/faq", "/wall-of-paid", "/versus", "/genres", "/cities"]
+    urls = ["/", "/singles", "/charts", "/get-paid", "/faq", "/wall-of-paid", "/versus", "/genres", "/cities"]
     urls += [f"/tape/{t['id']}" for t in tapes if is_live(dict(t))]
     urls += [(f"/@{a['vanity']}" if a["vanity"] else f"/artist/{a['id']}") for a in artists]
     urls += [f"/genre/{g}" for g in sorted(genres) if g]
@@ -1057,12 +1114,17 @@ def upload_page(request: Request):
     if redir:
         return redir
     if user["role"] != "artist":
-        return PlainTextResponse("Only Artist accounts can upload mixtapes.", status_code=403)
-    body = """<h1>Post a mixtape</h1>
+        return PlainTextResponse("Only Artist accounts can upload music.", status_code=403)
+    body = """<h1>Post music</h1>
 <p><span class="bigfree">FREE TO UPLOAD</span></p>
 <p class="muted">No card, no fee. Pro and Sponsored are optional — never required to post or earn.</p>
 <form method="post" action="/upload" enctype="multipart/form-data">
-<label>Mixtape title <input name="title" required></label>
+<label>What are you dropping?
+<select name="kind" id="kind-sel">
+<option value="tape">MIXTAPE — a full tape, one or more tracks</option>
+<option value="single">SINGLE — just one song</option>
+</select></label>
+<label><span id="title-label">Mixtape title</span> <input name="title" required></label>
 <label>Cover image (jpg / png / webp) <input name="cover" type="file" accept=".jpg,.jpeg,.png,.webp" required></label>
 <label>Genre <input name="genre" placeholder="Hip-Hop / Rap"></label>
 <label>Hosted by <span class="muted">(optional — a DJ or host credit, shown on your tape)</span> <input name="hosted_by" placeholder="DJ ..."></label>
@@ -1077,13 +1139,24 @@ def upload_page(request: Request):
 <option value="paid">PAID DOWNLOAD — stream free, download costs your price</option>
 </select></label>
 <label>Price if Paid Download ($) <input name="price" type="number" step="0.5" min="1" value="10"></label>
-<label>Audio tracks — mp3 / wav / m4a / ogg, up to 40MB each, add at least 1
-<input name="tracks" type="file" accept=".mp3,.wav,.m4a,.ogg" multiple required></label>
+<label><span id="tracks-label">Audio tracks — mp3 / wav / m4a / ogg, up to 40MB each, add at least 1</span>
+<input name="tracks" id="tracks-input" type="file" accept=".mp3,.wav,.m4a,.ogg" multiple required></label>
 <label style="display:flex;gap:8px;align-items:flex-start">
 <input type="checkbox" name="rights" value="yes" style="width:auto;margin-top:3px">
 <span>I confirm this music is mine or I have permission to post it. I keep 100% of my rights.</span></label>
-<button class="btn" type="submit">Post my mixtape — free</button></form>
+<button class="btn" type="submit">Post my music — free</button></form>
 <script>
+const kindSel = document.getElementById('kind-sel');
+function kindToggle(){
+  const single = kindSel.value === 'single';
+  document.getElementById('title-label').textContent = single ? 'Single title' : 'Mixtape title';
+  document.getElementById('tracks-label').textContent = single
+    ? 'Your song — one audio file, mp3 / wav / m4a / ogg, up to 40MB'
+    : 'Audio tracks — mp3 / wav / m4a / ogg, up to 40MB each, add at least 1';
+  const inp = document.getElementById('tracks-input');
+  if(single){ inp.removeAttribute('multiple'); } else { inp.setAttribute('multiple',''); }
+}
+kindSel.addEventListener('change', kindToggle); kindToggle();
 document.querySelector('form').addEventListener('submit', () => {
   const v = document.getElementById('prem-local').value;
   document.getElementById('prem-utc').value = v ? new Date(v).toISOString() : '';
@@ -1097,18 +1170,23 @@ async def upload(request: Request, title: str = Form(...), genre: str = Form("")
                  description: str = Form(""), download_mode: str = Form("free"),
                  price: float = Form(0), rights: str = Form(None),
                  hosted_by: str = Form(""), release_at_utc: str = Form(""),
+                 kind: str = Form("tape"),
                  cover: UploadFile = File(...), tracks: list[UploadFile] = File(...)):
     user = current_user(request)
     if not user:
         return PlainTextResponse("Log in first", status_code=401)
     if user["role"] != "artist":
-        return PlainTextResponse("Only Artist accounts can upload mixtapes.", status_code=403)
+        return PlainTextResponse("Only Artist accounts can upload music.", status_code=403)
     if rights != "yes":
         return PlainTextResponse("You must confirm you own this music or have permission to post it (rights attestation required).", status_code=400)
     if download_mode not in ("stream_only", "free", "paid"):
         return PlainTextResponse("Invalid download mode", status_code=400)
+    if kind not in ("tape", "single"):
+        return PlainTextResponse("Invalid release type", status_code=400)
     if not tracks:
         return PlainTextResponse("Add at least one audio track.", status_code=400)
+    if kind == "single" and len(tracks) != 1:
+        return PlainTextResponse("A single is exactly one song — upload one track, or post it as a mixtape instead.", status_code=400)
     # validate cover
     cover_ext = Path(cover.filename or "").suffix.lower()
     if cover_ext not in COVER_EXTS:
@@ -1150,10 +1228,10 @@ async def upload(request: Request, title: str = Form(...), genre: str = Form("")
             release_at = None
     conn = get_db()
     cur = conn.execute(
-        "INSERT INTO mixtapes(artist_id,title,cover_path,genre,description,download_mode,price_cents,created_at,hosted_by,release_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO mixtapes(artist_id,title,cover_path,genre,description,download_mode,price_cents,created_at,hosted_by,release_at,kind) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         (user["id"], title.strip(), "", genre.strip(), description.strip(),
-         download_mode, price_cents, now_iso(), hosted_by.strip()[:60], release_at))
+         download_mode, price_cents, now_iso(), hosted_by.strip()[:60], release_at, kind))
     tape_id = cur.lastrowid
     tape_dir = UPLOAD_ROOT / str(tape_id)
     tape_dir.mkdir(parents=True, exist_ok=True)
@@ -1170,7 +1248,7 @@ async def upload(request: Request, title: str = Form(...), genre: str = Form("")
     followers = conn.execute("SELECT follower_id FROM follows WHERE artist_id=?", (user["id"],)).fetchall()
     for f in followers:
         conn.execute("INSERT INTO notifications(user_id,text,tape_id,created_at) VALUES(?,?,?,?)",
-                     (f["follower_id"], f"{user['display_name']} just dropped a new tape: {title.strip()}", tape_id, now_iso()))
+                     (f["follower_id"], f"{user['display_name']} just dropped a new {'single' if kind == 'single' else 'tape'}: {title.strip()}", tape_id, now_iso()))
     conn.commit()
     conn.close()
     return RedirectResponse(f"/tape/{tape_id}", status_code=303)
@@ -1233,6 +1311,13 @@ def tape_page(request: Request, tape_id: int):
     golden_hero = ('<img class="goldentape" src="/static/golden-tape.jpg" alt="GOLDEN TAPE" '
                    'title="GOLDEN TAPE - the most-played tape on HITZ">') if golden_id == tape_id else ""
     golden_pill = ('<span class="badge gold">\U0001F947 GOLDEN TAPE — most plays on HITZ</span> ') if golden_id == tape_id else ""
+    if tape.get("kind") == "single":
+        golden_pill = '<span class="badge gold">\U0001F3B5 SINGLE</span> ' + golden_pill
+        if golden_single_id(conn) == tape_id:
+            golden_hero = ('<img class="goldentape" src="/static/golden-tape.jpg" alt="GOLDEN SINGLE" '
+                           'title="GOLDEN SINGLE - the most-played single on HITZ">')
+            golden_pill = ('<span class="badge gold">\U0001F3B5 SINGLE</span> '
+                           '<span class="badge gold">\U0001F947 GOLDEN SINGLE — most plays on HITZ</span> ')
 
     if not live and not owner:
         subs = conn.execute("SELECT COUNT(*) c FROM premiere_notify WHERE tape_id=?", (tape_id,)).fetchone()["c"]
