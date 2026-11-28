@@ -357,6 +357,12 @@ check("robots points to the sitemap", "sitemap.xml" in r.text)
 # ---------------- wave 2: radio, recommendations, QR, supporters, open verse
 r = anon.get("/radio")
 check("radio page loads with stations", r.status_code == 200 and "HITZ Radio" in r.text and "Golden" in r.text and "dhRadio" in r.text)
+r = anon.get("/api/radio/streetrunna")
+_feed = r.json() if r.status_code == 200 else {}
+check("streetrunna radio feed returns tracks", r.status_code == 200 and _feed.get("station") == "HITZ Radio" and _feed.get("count", 0) >= 1 and len(_feed.get("tracks", [])) == _feed.get("count"), str(_feed)[:200])
+if _feed.get("tracks"):
+    _t0 = _feed["tracks"][0]
+    check("streetrunna feed track shape + absolute stream url", _t0.get("title") and _t0.get("artist") == "Test Artist" and _t0.get("stream_url", "").endswith("/stream/%d" % _t0["track_id"]) and _t0.get("stream_url", "").startswith("http"), str(_t0))
 r = anon.get("/")
 check("home links the radio", "/radio" in r.text)
 r = fan.get(f"/tape/{tape1}")
@@ -457,5 +463,34 @@ check("golden single does not leak onto a tape page", "GOLDEN SINGLE" not in r.t
 
 r = anon.get("/faq")
 check("faq explains singles", "Can I drop a single" in r.text and "Top Singles chart" in r.text)
+
+# ------------------------------------------------ typed titles win (Wave 3.1)
+r = artist.get("/upload")
+check("upload form promises typed titles show", "never the file names on your audio" in r.text)
+
+r = upload_kind(artist, "Typed Anthem", "single", [("cw.wav", WAV1, "audio/wav")])
+check("single from a file named cw uploads", r.status_code == 303, str(r.status_code))
+anthem_id = int(r.headers["location"].rstrip("/").split("/")[-1])
+r = fan.get(f"/tape/{anthem_id}")
+check("single shows the typed title in the player", '"title": "Typed Anthem"' in r.text)
+check("the mp3 file name never shows as the song title", '"title": "cw"' not in r.text and "1. cw<" not in r.text)
+
+files = [("cover", ("cover.png", PNG_COVER, "image/png")),
+         ("tracks", ("zzz-one.wav", WAV1, "audio/wav")),
+         ("tracks", ("yyy-two.wav", WAV2, "audio/wav"))]
+r = artist.post("/upload", data={"title": "Two Song Tape", "genre": "Hip-Hop", "description": "t",
+                                 "download_mode": "free", "price": "10", "rights": "yes", "kind": "tape",
+                                 "track_titles": ["My First Song", ""]},
+                files=files, follow_redirects=False)
+check("two-song tape uploads", r.status_code == 303, str(r.status_code))
+two_id = int(r.headers["location"].rstrip("/").split("/")[-1])
+r = fan.get(f"/tape/{two_id}")
+check("typed per-song title shows", "1. My First Song" in r.text)
+check("blank title box falls back to the file name", "2. yyy two" in r.text)
+check("typed-over file name never shows", "zzz one" not in r.text)
+
+r = anon.get("/api/radio/streetrunna")
+titles = [t["title"] for t in r.json()["tracks"]]
+check("game radio feed uses the typed title for the single", "Typed Anthem" in titles and "cw" not in titles, str(titles))
 
 print(f"\nALL {len(PASS)} CHECKS PASSED")
