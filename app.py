@@ -756,7 +756,7 @@ Pro, Sponsored and Premium are <b>always optional</b> — never required to uplo
 <div class="card"><h3>Stream Share</h3><p>A share of the Fan Premium + ads pool, split by your real plays. Free plays build the audience; the pool is funded by Premium and ads.</p></div>
 <div class="card"><h3>Sponsored Spots — {spots_left} of {SPONSORED_MAX_ACTIVE} open</h3><p>Homepage placement: $49 / 3 days · $99 / 7 days · $199 / 14 days. Optional promo, bought by artists and labels.</p></div>
 <div class="card"><h3><a href="/wall-of-paid">Wall of Paid</a></h3><p>Every real artist payout, posted in public. Proof pays better than promises — <a href="/wall-of-paid">see the wall</a>.</p></div>
-<div class="card"><h3>Built for artist paydays</h3><p>Promo alone doesn't pay rent. On HITZ every tape can turn plays into money — downloads, tips, subs and stream share, all tracked in your earnings dashboard.</p></div>
+<div class="card"><h3>Built for artist paydays</h3><p>Promo alone doesn't pay rent. On HITZ every tape and single can turn plays into money — downloads, tips, subs and stream share, all tracked in your earnings dashboard.</p></div>
 </div>
 <h2>Earnings Calculator</h2>
 <div class="card">
@@ -790,13 +790,14 @@ document.querySelectorAll('#c-dl,#c-price,#c-tips,#c-subs,#c-pro').forEach(e=>e.
 
 
 FAQ_ITEMS = [
-    ("Is it free to upload?", "YES. Creating an Artist account and uploading mixtapes is completely free — no card, no upload fee. You can post, get a page, and earn from day one."),
+    ("Is it free to upload?", "YES. Creating an Artist account and uploading mixtapes and singles is completely free — no card, no upload fee. You can post, get a page, and earn from day one."),
+    ("Can I drop a single, or does it have to be a full mixtape?", "Singles are welcome. At upload you pick Mixtape or Single — a single is exactly one song. Singles get their own Singles page and Top Singles chart, and earn exactly like a tape: downloads, tips and fan subscriptions."),
     ("Do I need Pro or Sponsored to upload or earn?", "No. Artist Pro ($9.99/mo), Sponsored placement ($49/$99/$199) and Fan Premium ($6.99/mo) are optional extras. Pro adds a verified badge and a better 85/15 sales split; Sponsored buys homepage promo. Neither is ever required to upload or earn."),
     ("How do I make money as an artist?", "Four ways: paid downloads (you keep 80%, or 85% on Pro), tips (you keep 90%), fan subscriptions (you keep 80%), and stream share from the Fan Premium + ads pool split by your real plays."),
     ("How and when do I get paid?", "Earnings build in your Artist Earnings Dashboard, split into Paid and Pending. Cash-out starts at $25. You are paid only from money actually collected from fans — HITZ never pays out of its own pocket and never shows fake balances."),
     ("What does HITZ keep?", "20% of paid download sales (15% if you are Pro), 10% of tips, and 20% of fan subscriptions. Sponsored, Pro and Premium fees are platform revenue. Stripe fees come out before any split."),
     ("Do I keep the rights to my music?", "Yes — you keep 100% of your rights. At upload you confirm the music is yours or you have permission to post it. That protects you and the platform."),
-    ("Can I control downloads of my tape?", "Yes. Every tape has a download mode you pick at upload and can change anytime: Stream Only (no downloads for anyone), Free Download (free Fan account), or Paid Download (stream free, download costs your price)."),
+    ("Can I control downloads of my music?", "Yes. Every release — tape or single — has a download mode you pick at upload and can change anytime: Stream Only (no downloads for anyone), Free Download (free Fan account), or Paid Download (stream free, download costs your price)."),
     ("What counts as a play?", "A play counts when a listener actually starts playing your tape. The same listener replaying the same tape on the same day does not inflate your count — plays are deduped per listener per day."),
     ("How do free downloads help me if they're free?", "A free download requires a free Fan account and automatically follows you, so every free download grows your fan list. Those followers get alerted on your next drop — and buy the next tape."),
     ("What is Fan Premium?", "An optional $6.99/mo fan plan for unlimited downloads of tapes artists set as free or paid-for-download (paid tapes still cost their price unless purchased). Premium is never required to listen."),
