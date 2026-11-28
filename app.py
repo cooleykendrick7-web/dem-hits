@@ -261,6 +261,14 @@ def tape_stats(conn, tape_id: int):
     return {"plays": plays, "downloads": downloads, "likes": likes}
 
 
+def shown_track_title(tape_title, track_title, n_tracks):
+    """The name a song is shown with in public. For a one-song release, the
+    title the artist typed for the release IS the song's title — the file
+    name on the audio they uploaded never shows. On multi-track tapes each
+    song keeps its own (typed) title."""
+    return tape_title if n_tracks == 1 else track_title
+
+
 def chart_rows(conn, since_iso=None, limit=50, kind=None):
     rows = conn.execute(
         "SELECT m.*, u.display_name artist_name, u.vanity artist_vanity, u.city artist_city FROM mixtapes m JOIN users u ON u.id=m.artist_id "
@@ -926,7 +934,7 @@ def embed_player(request: Request, tape_id: int):
     live = is_live(tape)
     if live:
         players = "".join(
-            f"<div style='margin:8px 0'><div style='font-size:.9rem;margin-bottom:3px'>{i+1}. {html.escape(t['title'])}</div>"
+            f"<div style='margin:8px 0'><div style='font-size:.9rem;margin-bottom:3px'>{i+1}. {html.escape(shown_track_title(tape['title'], t['title'], len(tracks)))}</div>"
             f"<audio controls preload='none' src='/stream/{t['id']}' style='width:100%'></audio></div>"
             for i, t in enumerate(tracks))
         inner = players + f"<p style='margin:10px 0 0'><a href='{base}/tape/{tape_id}' target='_blank' style='color:#e8c15a'>Listen on HITZ \u2192</a></p>"
@@ -1142,20 +1150,38 @@ def upload_page(request: Request):
 <label>Price if Paid Download ($) <input name="price" type="number" step="0.5" min="1" value="10"></label>
 <label><span id="tracks-label">Audio tracks — mp3 / wav / m4a / ogg, up to 40MB each, add at least 1</span>
 <input name="tracks" id="tracks-input" type="file" accept=".mp3,.wav,.m4a,.ogg" multiple required></label>
+<div id="track-titles"></div>
+<p class="muted" id="titles-note">Type each song's title exactly how you want it shown — your name and your titles are what fans see, never the file names on your audio.</p>
 <label style="display:flex;gap:8px;align-items:flex-start">
 <input type="checkbox" name="rights" value="yes" style="width:auto;margin-top:3px">
 <span>I confirm this music is mine or I have permission to post it. I keep 100% of my rights.</span></label>
 <button class="btn" type="submit">Post my music — free</button></form>
 <script>
 const kindSel = document.getElementById('kind-sel');
+const tracksInput = document.getElementById('tracks-input');
+function buildTitleBoxes(){
+  const box = document.getElementById('track-titles');
+  const single = kindSel.value === 'single';
+  box.innerHTML = '';
+  document.getElementById('titles-note').style.display = single ? 'none' : '';
+  if(single) return;
+  [...tracksInput.files].forEach((f, i) => {
+    const lab = document.createElement('label');
+    lab.textContent = 'Title for ' + f.name + ' ';
+    const inp = document.createElement('input');
+    inp.name = 'track_titles'; inp.placeholder = 'Song title as fans should see it'; inp.maxLength = 120;
+    lab.appendChild(inp); box.appendChild(lab);
+  });
+}
+tracksInput.addEventListener('change', buildTitleBoxes);
 function kindToggle(){
   const single = kindSel.value === 'single';
   document.getElementById('title-label').textContent = single ? 'Single title' : 'Mixtape title';
   document.getElementById('tracks-label').textContent = single
     ? 'Your song — one audio file, mp3 / wav / m4a / ogg, up to 40MB'
     : 'Audio tracks — mp3 / wav / m4a / ogg, up to 40MB each, add at least 1';
-  const inp = document.getElementById('tracks-input');
-  if(single){ inp.removeAttribute('multiple'); } else { inp.setAttribute('multiple',''); }
+  if(single){ tracksInput.removeAttribute('multiple'); } else { tracksInput.setAttribute('multiple',''); }
+  buildTitleBoxes();
 }
 kindSel.addEventListener('change', kindToggle); kindToggle();
 document.querySelector('form').addEventListener('submit', () => {
@@ -1171,7 +1197,7 @@ async def upload(request: Request, title: str = Form(...), genre: str = Form("")
                  description: str = Form(""), download_mode: str = Form("free"),
                  price: float = Form(0), rights: str = Form(None),
                  hosted_by: str = Form(""), release_at_utc: str = Form(""),
-                 kind: str = Form("tape"),
+                 kind: str = Form("tape"), track_titles: list[str] = Form([]),
                  cover: UploadFile = File(...), tracks: list[UploadFile] = File(...)):
     user = current_user(request)
     if not user:
@@ -1242,7 +1268,14 @@ async def upload(request: Request, title: str = Form(...), genre: str = Form("")
     for i, (fname, ext, data) in enumerate(track_data, 1):
         safe = f"track{i}{ext}"
         (tape_dir / safe).write_bytes(data)
-        track_title = Path(fname).stem.replace("_", " ").replace("-", " ").strip() or f"Track {i}"
+        # The title the artist typed wins — never the audio file's own name.
+        typed = track_titles[i - 1].strip()[:120] if i - 1 < len(track_titles) else ""
+        if kind == "single":
+            track_title = title.strip()
+        elif typed:
+            track_title = typed
+        else:
+            track_title = Path(fname).stem.replace("_", " ").replace("-", " ").strip() or f"Track {i}"
         conn.execute("INSERT INTO tracks(tape_id,title,file_path,track_num) VALUES(?,?,?,?)",
                      (tape_id, track_title, str(tape_dir / safe), i))
     # notify followers
@@ -1361,10 +1394,11 @@ tick(); setInterval(tick, 1000);
         return layout(request, tape["title"], body, user, og=og)
 
     tracks = conn.execute("SELECT * FROM tracks WHERE tape_id=? ORDER BY track_num", (tape_id,)).fetchall()
-    js_tracks = json.dumps([{"id": t["id"], "title": t["title"], "artist": tape["artist_name"]} for t in tracks])
+    js_tracks = json.dumps([{"id": t["id"], "title": shown_track_title(tape["title"], t["title"], len(tracks)),
+                             "artist": tape["artist_name"]} for t in tracks])
     track_lines = "".join(
         f"""<div class="trackline"><button class="btn small" onclick='dhPlay({js_tracks},{i},{tape_id})'>\u25B6</button>
-<span>{i+1}. {html.escape(t['title'])}</span></div>""" for i, t in enumerate(tracks))
+<span>{i+1}. {html.escape(shown_track_title(tape['title'], t['title'], len(tracks)))}</span></div>""" for i, t in enumerate(tracks))
     if tape["download_mode"] == "stream_only":
         dl = '<p><span class="badge dark">STREAM ONLY</span> <span class="muted">Downloads are off for this tape — the artist\'s setting always wins.</span></p>'
     elif tape["download_mode"] == "free":
@@ -1893,7 +1927,8 @@ def radio_page(request: Request):
     conn = get_db()
     sweep_premieres(conn)
     rows = conn.execute(
-        "SELECT t.id track_id, t.title track_title, m.id tape_id, m.title tape_title, m.genre "
+        "SELECT t.id track_id, t.title track_title, m.id tape_id, m.title tape_title, m.genre, "
+        "(SELECT COUNT(*) FROM tracks t2 WHERE t2.tape_id=m.id) n_tracks "
         "FROM tracks t JOIN mixtapes m ON m.id=t.tape_id "
         "WHERE m.removed=0 AND (m.release_at IS NULL OR m.release_at<=?) ORDER BY m.created_at DESC",
         (now_iso(),)).fetchall()
@@ -1901,7 +1936,8 @@ def radio_page(request: Request):
         "SELECT m.id, u.display_name artist_name FROM mixtapes m JOIN users u ON u.id=m.artist_id").fetchall()}
 
     def item(r):
-        return {"id": r["track_id"], "title": r["track_title"], "tape": r["tape_id"],
+        return {"id": r["track_id"], "title": shown_track_title(r["tape_title"], r["track_title"], r["n_tracks"]),
+                "tape": r["tape_id"],
                 "artist": (names[r["tape_id"]]["artist_name"] if r["tape_id"] in names else "") + " — " + r["tape_title"]}
 
     all_items = [item(r) for r in rows]
@@ -2113,7 +2149,7 @@ def build_tape_zip(conn, tape) -> bytes:
         for t in tracks:
             p = Path(t["file_path"])
             if p.exists():
-                z.write(p, arcname=f"{t['track_num']:02d} - {t['title']}{p.suffix.lower()}")
+                z.write(p, arcname=f"{t['track_num']:02d} - {shown_track_title(tape['title'], t['title'], len(tracks))}{p.suffix.lower()}")
     return buf.getvalue()
 
 
@@ -2366,6 +2402,40 @@ def sponsored_spots():
     conn.close()
     return {"total": SPONSORED_MAX_ACTIVE, "active": active,
             "left": max(0, SPONSORED_MAX_ACTIVE - active)}
+
+
+@app.get("/api/radio/streetrunna")
+def radio_streetrunna(request: Request):
+    """Integration Law: HITZ Radio feed for Street Runna (the game).
+
+    Same rotation source as GET /radio — every released, non-removed
+    track, newest first — as JSON the game's car radio can consume.
+    Each play in-game is counted via the existing POST /play/{tape_id}.
+    Honest empty state: when HITZ has no tracks, tracks=[] / count=0.
+    No fake tracks are ever invented here."""
+    conn = get_db()
+    sweep_premieres(conn)
+    rows = conn.execute(
+        "SELECT t.id track_id, t.title track_title, m.id tape_id, m.title tape_title, m.genre, "
+        "(SELECT COUNT(*) FROM tracks t2 WHERE t2.tape_id=m.id) n_tracks "
+        "FROM tracks t JOIN mixtapes m ON m.id=t.tape_id "
+        "WHERE m.removed=0 AND (m.release_at IS NULL OR m.release_at<=?) ORDER BY m.created_at DESC",
+        (now_iso(),)).fetchall()
+    names = {r["id"]: r for r in conn.execute(
+        "SELECT m.id, u.display_name artist_name FROM mixtapes m JOIN users u ON u.id=m.artist_id").fetchall()}
+    conn.close()
+    base = site_base(request)
+    tracks = [{
+        "track_id": r["track_id"],
+        "title": shown_track_title(r["tape_title"], r["track_title"], r["n_tracks"]),
+        "artist": names[r["tape_id"]]["artist_name"] if r["tape_id"] in names else "",
+        "tape_id": r["tape_id"],
+        "tape_title": r["tape_title"],
+        "genre": r["genre"] or "",
+        "stream_url": f"{base}/stream/{r['track_id']}",
+    } for r in rows]
+    return {"station": "HITZ Radio", "source": "hitzmixtapes.com/radio",
+            "count": len(tracks), "tracks": tracks}
 
 
 # ---------------------------------------------------------------- HITZ RIPS trading cards
