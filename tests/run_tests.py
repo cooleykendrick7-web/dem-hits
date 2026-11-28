@@ -455,4 +455,7 @@ check("golden single pill on its own page", "GOLDEN SINGLE" in r.text)
 r = fan.get(f"/tape/{tape1}")
 check("golden single does not leak onto a tape page", "GOLDEN SINGLE" not in r.text)
 
+r = anon.get("/faq")
+check("faq explains singles", "Can I drop a single" in r.text and "Top Singles chart" in r.text)
+
 print(f"\nALL {len(PASS)} CHECKS PASSED")
